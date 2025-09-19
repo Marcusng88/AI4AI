@@ -1,0 +1,45 @@
+# Core Dependencies for Automation Agent with AWS Bedrock AgentCore
+# Based on Context7 documentation: https://github.com/awslabs/amazon-bedrock-agentcore-samples
+
+# Core Python packages
+boto3>=1.39.15
+botocore>=1.39.15
+
+# Strands Agents Framework
+strands-agents>=0.1.0
+
+# AWS Bedrock AgentCore (Required for browser automation)
+bedrock-agentcore>=0.1.0
+
+# Additional tools for Strands
+strands-agents-tools>=0.1.0
+
+# Nova Act for browser automation
+nova-act>=0.1.0
+
+# Playwright for browser control (used by Nova Act)
+playwright>=1.40.0
+
+# Web automation (optional, for advanced use cases)
+browser-use>=0.1.0
+
+# Rich for console output (used in AgentCore examples)
+rich>=13.0.0
+
+# Async support
+asyncio-compat>=0.1.0
+
+# JSON handling
+orjson>=3.9.0
+
+# HTTP client for MCP and API calls
+httpx>=0.24.0
+requests>=2.31.0
+
+# Optional: For live browser viewing (from Context7 examples)
+# nova-act>=0.1.0  # Uncomment if using Nova Act
+# playwright>=1.40.0  # Uncomment if using Playwright directly
+
+# Development and testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
