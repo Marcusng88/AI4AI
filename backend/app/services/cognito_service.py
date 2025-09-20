@@ -48,16 +48,16 @@ class CognitoService:
     
     def __init__(self):
         """Initialize Cognito service with configuration from environment."""
-        # Cognito configuration from your setup
-        self.region = "ap-southeast-2"
-        self.user_pool_id = "ap-southeast-2_KbRSvyt1T"
-        self.client_id = "25de8c235cphr8mqqoenamc6dn"
+        # Cognito configuration for ap-southeast-5
+        self.region = "ap-southeast-5"
+        self.user_pool_id = "ap-southeast-5_nuC0or8vA"
+        self.client_id = "1djcgis021homk7vjhaoamfuek"
         self.client_secret = None  # SPA client doesn't have a secret
         
         # OAuth URLs
         self.authority = f"https://cognito-idp.{self.region}.amazonaws.com/{self.user_pool_id}"
         # OAuth URLs
-        self.oauth_base_url = f"https://ap-southeast-2kbrsvyt1t.auth.{self.region}.amazoncognito.com"
+        self.oauth_base_url = f"https://ap-southeast-5nuc0or8va.auth.{self.region}.amazoncognito.com"
         
         # JWT verification
         self.jwks_url = f"{self.authority}/.well-known/jwks.json"
@@ -73,7 +73,7 @@ class CognitoService:
             "response_type": "code",
             "client_id": self.client_id,
             "redirect_uri": redirect_uri,
-            "scope": "openid email phone profile"
+            "scope": "openid email profile"
         }
         
         if state:

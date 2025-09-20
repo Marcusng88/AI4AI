@@ -22,20 +22,25 @@ class ConnectionManager:
     
     async def connect(self, websocket: WebSocket, session_id: str):
         """Accept a WebSocket connection and add to active connections."""
-        await websocket.accept()
-        
-        if session_id not in self.active_connections:
-            self.active_connections[session_id] = set()
-        
-        self.active_connections[session_id].add(websocket)
-        logger.info(f"WebSocket connected for session {session_id}. Total connections: {len(self.active_connections[session_id])}")
-        
-        # Send initial connection confirmation
-        await self.send_personal_message({
-            "type": "browser_viewer_connected",
-            "message": "Connected to browser viewer",
-            "session_id": session_id
-        }, websocket)
+        try:
+            await websocket.accept()
+            
+            if session_id not in self.active_connections:
+                self.active_connections[session_id] = set()
+            
+            self.active_connections[session_id].add(websocket)
+            logger.info(f"WebSocket connected for session {session_id}. Total connections: {len(self.active_connections[session_id])}")
+            
+            # Send initial connection confirmation
+            await self.send_personal_message({
+                "type": "browser_viewer_connected",
+                "message": "Connected to browser viewer",
+                "session_id": session_id,
+                "timestamp": asyncio.get_event_loop().time()
+            }, websocket)
+        except Exception as e:
+            logger.error(f"Error accepting WebSocket connection for session {session_id}: {e}")
+            raise
     
     def disconnect(self, websocket: WebSocket, session_id: str):
         """Remove a WebSocket connection."""
@@ -102,45 +107,67 @@ manager = ConnectionManager()
 @router.websocket("/ws/browser-viewer/{session_id}")
 async def websocket_browser_viewer(websocket: WebSocket, session_id: str):
     """WebSocket endpoint for browser viewer communication."""
-    await manager.connect(websocket, session_id)
-    
     try:
+        await manager.connect(websocket, session_id)
+        
         while True:
-            # Receive message from client
-            data = await websocket.receive_text()
-            message = json.loads(data)
+            try:
+                # Receive message from client
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                # Handle different message types
+                if message.get("type") == "request_browser_status":
+                    # Request current browser status
+                    # This would typically query the automation agent for current status
+                    # For now, return a default status - this should be enhanced to check actual automation state
+                    await manager.send_personal_message({
+                        "type": "browser_status",
+                        "status": {
+                            "status": "connected",
+                            "browser_connected": False,
+                            "hyperbrowser_session_active": False,
+                            "live_url": None
+                        },
+                        "session_id": session_id
+                    }, websocket)
+                
+                elif message.get("type") == "take_control":
+                    # Handle user taking control
+                    await manager.broadcast_control_event(session_id, "control_taken")
+                    logger.info(f"User took control for session {session_id}")
+                
+                elif message.get("type") == "release_control":
+                    # Handle user releasing control
+                    await manager.broadcast_control_event(session_id, "control_released")
+                    logger.info(f"User released control for session {session_id}")
+                
+                else:
+                    logger.warning(f"Unknown message type received: {message.get('type')}")
             
-            # Handle different message types
-            if message.get("type") == "request_browser_status":
-                # Request current browser status
-                # This would typically query the automation agent for current status
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON received from session {session_id}: {e}")
                 await manager.send_personal_message({
-                    "type": "browser_status",
-                    "status": {
-                        "status": "unknown",
-                        "browser_connected": False,
-                        "hyperbrowser_session_active": False
-                    },
+                    "type": "error",
+                    "message": "Invalid message format",
                     "session_id": session_id
                 }, websocket)
-            
-            elif message.get("type") == "take_control":
-                # Handle user taking control
-                await manager.broadcast_control_event(session_id, "control_taken")
-                logger.info(f"User took control for session {session_id}")
-            
-            elif message.get("type") == "release_control":
-                # Handle user releasing control
-                await manager.broadcast_control_event(session_id, "control_released")
-                logger.info(f"User released control for session {session_id}")
-            
-            else:
-                logger.warning(f"Unknown message type received: {message.get('type')}")
+            except Exception as e:
+                logger.error(f"Error processing message for session {session_id}: {e}")
+                await manager.send_personal_message({
+                    "type": "error",
+                    "message": f"Error processing message: {str(e)}",
+                    "session_id": session_id
+                }, websocket)
     
     except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for session {session_id}")
         manager.disconnect(websocket, session_id)
     except Exception as e:
         logger.error(f"WebSocket error for session {session_id}: {e}")
+        manager.disconnect(websocket, session_id)
+    finally:
+        # Ensure cleanup
         manager.disconnect(websocket, session_id)
 
 # Utility functions for other parts of the application to use

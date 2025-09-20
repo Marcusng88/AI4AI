@@ -49,6 +49,7 @@ export function BrowserPanel({
   const [userHasControl, setUserHasControl] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [connectionAttempts, setConnectionAttempts] = useState(0);
   
   const wsRef = useRef<WebSocket | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -60,6 +61,11 @@ export function BrowserPanel({
 
     const connectWebSocket = () => {
       try {
+        // Only create new connection if none exists or it's closed
+        if (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN)) {
+          return;
+        }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws/browser-viewer/${sessionId}`;
         
@@ -70,11 +76,14 @@ export function BrowserPanel({
           setIsConnected(true);
           setError(null);
           setIsLoading(false);
+          setConnectionAttempts(0); // Reset connection attempts on successful connection
           
           // Request initial browser status
-          wsRef.current?.send(JSON.stringify({
-            type: 'request_browser_status'
-          }));
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({
+              type: 'request_browser_status'
+            }));
+          }
         };
         
         wsRef.current.onmessage = (event) => {
@@ -86,28 +95,67 @@ export function BrowserPanel({
           }
         };
         
-        wsRef.current.onclose = () => {
-          console.log('Browser panel WebSocket disconnected');
+        wsRef.current.onclose = (event) => {
+          console.log('Browser panel WebSocket disconnected', event.code, event.reason);
           setIsConnected(false);
           
-          // Attempt to reconnect after 3 seconds
-          if (isVisible) {
-            reconnectTimeoutRef.current = setTimeout(() => {
-              connectWebSocket();
-            }, 3000);
+          // Handle different close codes
+          if (event.code === 1000) {
+            // Normal closure - don't show error or attempt reconnect
+            console.log('WebSocket closed normally');
+          } else if (event.code === 1001 || event.code === 1006) {
+            // Going away or abnormal closure - attempt reconnect
+            console.log('WebSocket closed abnormally, attempting reconnect...');
+            if (isVisible) {
+              const attempts = connectionAttempts + 1;
+              setConnectionAttempts(attempts);
+              
+              // Only show error after multiple failed attempts
+              if (attempts > 3) {
+                setError('Connection lost. Please check your network connection.');
+              }
+              
+              reconnectTimeoutRef.current = setTimeout(() => {
+                connectWebSocket();
+              }, 3000);
+            }
+          } else {
+            // Other error codes
+            console.log(`WebSocket closed with code ${event.code}: ${event.reason}`);
+            if (isVisible) {
+              const attempts = connectionAttempts + 1;
+              setConnectionAttempts(attempts);
+              
+              // Only show error after multiple failed attempts
+              if (attempts > 3) {
+                setError(`Connection error (${event.code}). Please try refreshing the page.`);
+              }
+              
+              reconnectTimeoutRef.current = setTimeout(() => {
+                connectWebSocket();
+              }, 3000);
+            }
           }
         };
         
         wsRef.current.onerror = (error) => {
-          console.error('Browser panel WebSocket error:', error);
-          setError('Connection error. Attempting to reconnect...');
+          // WebSocket errors are often not very informative, so we handle them gracefully
+          console.warn('Browser panel WebSocket connection error occurred');
+          // Don't immediately show error to user - let onclose handle reconnection
           setIsLoading(false);
         };
         
       } catch (err) {
         console.error('Error connecting to browser panel WebSocket:', err);
-        setError('Failed to connect to browser panel. Please check if the server is running.');
         setIsLoading(false);
+        
+        const attempts = connectionAttempts + 1;
+        setConnectionAttempts(attempts);
+        
+        // Only show error after multiple failed attempts
+        if (attempts > 2) {
+          setError('Failed to connect to browser panel. Please check if the server is running.');
+        }
         
         // Attempt to reconnect after a delay
         if (isVisible) {
@@ -121,11 +169,19 @@ export function BrowserPanel({
     connectWebSocket();
 
     return () => {
+      // Clear any pending reconnection attempts
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
       }
+      
+      // Properly close WebSocket connection
       if (wsRef.current) {
-        wsRef.current.close();
+        // Check if connection is in a state where it can be closed
+        if (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.close(1000, 'Component unmounting');
+        }
+        wsRef.current = null;
       }
     };
   }, [isVisible, sessionId]);
@@ -178,17 +234,25 @@ export function BrowserPanel({
   };
 
   const handleTakeControl = () => {
-    wsRef.current?.send(JSON.stringify({
-      type: 'take_control'
-    }));
-    onTakeControl?.();
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'take_control'
+      }));
+      onTakeControl?.();
+    } else {
+      setError('WebSocket connection not available');
+    }
   };
 
   const handleReleaseControl = () => {
-    wsRef.current?.send(JSON.stringify({
-      type: 'release_control'
-    }));
-    onReleaseControl?.();
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'release_control'
+      }));
+      onReleaseControl?.();
+    } else {
+      setError('WebSocket connection not available');
+    }
   };
 
   const toggleFullscreen = () => {
@@ -219,9 +283,15 @@ export function BrowserPanel({
           <div className="flex items-center space-x-2">
             <Monitor className="h-5 w-5" />
             <CardTitle className="text-lg">Live View</CardTitle>
-            <Badge variant={isBrowserActive ? "default" : "secondary"}>
-              {isBrowserActive ? "Active" : "Inactive"}
+            <Badge variant={isConnected ? "default" : "secondary"}>
+              {isConnected ? "Connected" : "Disconnected"}
             </Badge>
+            {isBrowserActive && (
+              <Badge variant="default" className="flex items-center gap-1">
+                <Bot className="h-3 w-3" />
+                Browser Active
+              </Badge>
+            )}
             {userHasControl && (
               <Badge variant="destructive" className="flex items-center gap-1">
                 <MousePointer className="h-3 w-3" />
@@ -248,6 +318,9 @@ export function BrowserPanel({
               <div className="text-center">
                 <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-2"></div>
                 <p className="text-sm text-gray-600">Connecting to browser...</p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Establishing WebSocket connection...
+                </p>
               </div>
             </div>
           )}
@@ -257,31 +330,58 @@ export function BrowserPanel({
               <div className="text-center">
                 <div className="text-red-600 mb-2">⚠️</div>
                 <p className="text-sm text-red-600">{error}</p>
+                <p className="text-xs text-gray-500 mt-1">
+                  Check if the server is running and try again
+                </p>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => window.location.reload()}
+                  onClick={() => {
+                    setError(null);
+                    setIsLoading(true);
+                    // Force reconnection
+                    if (wsRef.current) {
+                      wsRef.current.close();
+                    }
+                  }}
                   className="mt-2"
                 >
-                  Retry
+                  Retry Connection
                 </Button>
               </div>
             </div>
           )}
           
-          {!isLoading && !error && !isBrowserActive && (
-            <div className="flex items-center justify-center h-64 bg-gray-50">
+          {!isConnected && !isLoading && !error && (
+            <div className="flex items-center justify-center h-64 bg-blue-50">
               <div className="text-center">
-                <Monitor className="h-12 w-12 text-gray-400 mx-auto mb-2" />
-                <p className="text-sm text-gray-600">Browser not initialized</p>
-                <p className="text-xs text-gray-500 mt-1">
-                  The browser will appear here when automation starts
+                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 mx-auto mb-2"></div>
+                <p className="text-sm text-blue-600">Connecting to browser viewer...</p>
+                <p className="text-xs text-blue-500 mt-1">
+                  Establishing connection...
                 </p>
               </div>
             </div>
           )}
           
-          {!isLoading && !error && isBrowserActive && currentLiveUrl && (
+          {isConnected && !isLoading && !error && !isBrowserActive && (
+            <div className="flex items-center justify-center h-64 bg-blue-50">
+              <div className="text-center">
+                <Monitor className="h-12 w-12 text-blue-400 mx-auto mb-2" />
+                <p className="text-sm text-blue-600">Waiting for browser session</p>
+                <p className="text-xs text-blue-500 mt-1">
+                  The browser will appear here when automation starts
+                </p>
+                <div className="flex items-center justify-center mt-2">
+                  <div className="animate-pulse bg-blue-200 rounded-full h-2 w-2 mx-1"></div>
+                  <div className="animate-pulse bg-blue-200 rounded-full h-2 w-2 mx-1 delay-100"></div>
+                  <div className="animate-pulse bg-blue-200 rounded-full h-2 w-2 mx-1 delay-200"></div>
+                </div>
+              </div>
+            </div>
+          )}
+          
+          {isConnected && !isLoading && !error && isBrowserActive && currentLiveUrl && (
             <div className="flex flex-col h-full">
               {/* Control buttons */}
               <div className="flex items-center justify-between p-2 border-b bg-gray-50">
@@ -364,13 +464,13 @@ export function BrowserPanel({
             </div>
           )}
           
-          {!isLoading && !error && isBrowserActive && !currentLiveUrl && (
+          {isConnected && !isLoading && !error && isBrowserActive && !currentLiveUrl && (
             <div className="flex items-center justify-center h-64 bg-yellow-50">
               <div className="text-center">
                 <div className="text-yellow-600 mb-2">⚠️</div>
                 <p className="text-sm text-yellow-600">Browser active but live URL not available</p>
                 <p className="text-xs text-yellow-500 mt-1">
-                  This may be a local browser session
+                  This may be a local browser session or the URL is being generated
                 </p>
               </div>
             </div>

@@ -1,10 +1,10 @@
 /**
  * AWS Amplify configuration for Cognito authentication
- * Based on your NEW Cognito setup:
- * - User Pool ID: ap-southeast-2_KbRSvyt1T
- * - Client ID: 25de8c235cphr8mqqoenamc6dn (SPA - no client secret)
- * - Domain: ap-southeast-2kbrsvyt1t.auth.ap-southeast-2.amazoncognito.com
- * - Region: ap-southeast-2
+ * Updated for ap-southeast-5 region:
+ * - User Pool ID: ap-southeast-5_nuC0or8vA
+ * - Client ID: 1djcgis021homk7vjhaoamfuek (SPA - no client secret)
+ * - Domain: ap-southeast-5nuc0or8va.auth.ap-southeast-5.amazoncognito.com
+ * - Region: ap-southeast-5
  */
 
 import { Amplify } from 'aws-amplify'
@@ -19,13 +19,13 @@ const isLocalhost = typeof window !== 'undefined' && (
 const amplifyConfig = {
   Auth: {
     Cognito: {
-      userPoolId: 'ap-southeast-2_KbRSvyt1T',
+      userPoolId: 'ap-southeast-5_nuC0or8vA',
       // New public client ID (no client secret - perfect for SPAs)
-      userPoolClientId: '25de8c235cphr8mqqoenamc6dn',
+      userPoolClientId: '1djcgis021homk7vjhaoamfuek',
       loginWith: {
         oauth: {
-          domain: 'ap-southeast-2kbrsvyt1t.auth.ap-southeast-2.amazoncognito.com',
-          scopes: ['openid', 'email', 'profile', 'aws.cognito.signin.user.admin'],
+          domain: 'ap-southeast-5nuc0or8va.auth.ap-southeast-5.amazoncognito.com',
+          scopes: ['email','openid', 'profile'],
           redirectSignIn: [
             'http://localhost:3000/auth/callback'
           ],

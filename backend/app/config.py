@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     workers: int = 1
 
     # AWS
-    aws_region: Optional[str] = os.getenv("DEFAULT_AWS_REGION", "ap-southeast-2")
+    aws_region: Optional[str] = os.getenv("DEFAULT_AWS_REGION", "ap-southeast-5")
     aws_access_key_id: Optional[str] = os.getenv("AWS_ACCESS_KEY_ID")
     aws_secret_access_key: Optional[str] = os.getenv("AWS_SECRET_ACCESS_KEY")
     
@@ -30,8 +30,9 @@ class Settings(BaseSettings):
     dynamodb_chat_sessions_table: str = "ai4ai-chat-sessions"
     dynamodb_chat_messages_table: str = "ai4ai-chat-messages"
 
-    # Bedrock
+    # Bedrock Configuration (ap-southeast-2 because ap-southeast-5 doesn't support Bedrock)
     bedrock_model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    bedrock_region: str = "ap-southeast-2"  # Bedrock available region
     bedrock_agent_core_region: str = "us-west-2"
     
     # Strands

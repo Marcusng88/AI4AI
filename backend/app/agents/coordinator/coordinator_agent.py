@@ -1,7 +1,10 @@
 """
-Intelligent Coordinator Agent using CrewAI for government service automation.
-Uses LLM-based reasoning and decision making instead of rule-based approaches.
-Includes memory capabilities for persistent conversation context.
+Enhanced Coordinator Agent using CrewAI for government service automation.
+Implements Phase 1 of the 3-agent architecture with:
+- Chain-of-thought prompting for dynamic intent detection
+- Enhanced Tavily research capabilities
+- Memory management integration
+- Foundation for Validator and Automation agent handoffs
 """
 
 import asyncio
@@ -9,23 +12,195 @@ import os
 import time
 import json
 import uuid
-from typing import Dict, Any, List, Optional
+import re
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 
 import boto3
 from botocore.exceptions import ClientError
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.memory.short_term.short_term_memory import ShortTermMemory
 from crewai.memory.entity.entity_memory import EntityMemory
+from pydantic import BaseModel, Field
 
 from app.core.logging import get_logger
 from app.config import settings
 from .tavily_tool import TavilySearchTool
-# Removed complex human tools - using simple prompting approach instead
-# from ..automation.automation_agent import automation_agent  # Commented out for now
-from ..stagehand.stagehand_agent import GovernmentServicesAgent
+from ..validator.validator_agent import ValidatorAgent, validator_agent
+from ..automation.automation_agent import AutomationAgent, automation_agent
+from ..automation.nova_act_agent import NovaActAgent, nova_act_agent
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class IntentAnalysis:
+    """Data class for intent analysis results."""
+    intent_type: str
+    service_category: str
+    confidence_score: float
+    requires_research: bool
+    requires_credentials: bool
+    missing_information: List[str]
+    suggested_next_steps: List[str]
+    reasoning: str
+
+
+@dataclass
+class ResearchResults:
+    """Data class for research results."""
+    target_websites: List[str]
+    process_steps: List[str]
+    required_credentials: List[str]
+    required_information: List[str]
+    research_confidence: float
+    research_summary: str
+
+
+class ChainOfThoughtPrompting:
+    """Chain-of-thought prompting utilities for enhanced reasoning."""
+    
+    @staticmethod
+    def create_intent_detection_prompt(user_message: str, context: Dict[str, Any] = None) -> str:
+        """Create a chain-of-thought prompt for intent detection."""
+        context_str = ""
+        if context:
+            context_items = [f"{k}: {v}" for k, v in context.items() if v]
+            if context_items:
+                context_str = f"\n\nUser Context:\n" + "\n".join(context_items)
+        
+        return f"""You are an expert coordinator for Malaysian government services. Analyze the user request using chain-of-thought reasoning.
+
+USER REQUEST: "{user_message}"{context_str}
+
+Think step by step:
+
+1. **Intent Analysis**:
+   - What is the user trying to accomplish?
+   - What type of government service is involved?
+   - Is this a payment, inquiry, registration, renewal, or other type of request?
+   
+2. **Service Categorization**:
+   - Which government department/agency is involved? (JPJ, LHDN, JPN, EPF, MyEG, etc.)
+   - What specific service or process is being requested?
+   
+3. **Information Requirements**:
+   - What information does the user need to provide?
+   - What credentials (login, IC, etc.) are required?
+   - What information is missing that needs to be requested?
+   
+4. **Process Complexity**:
+   - How complex is this request?
+   - Does it require research to understand the process?
+   - Can it be handled directly or needs delegation?
+   
+5. **Next Steps Planning**:
+   - Should this be researched first using web search?
+   - Should credentials be requested from the user?
+   - Should this be delegated to a specialist agent?
+
+Based on your analysis, provide a structured response in JSON format:
+{{
+    "intent_type": "payment|inquiry|registration|renewal|other",
+    "service_category": "jpj|lhdn|jpn|epf|myeg|other",
+    "confidence_score": 0.95,
+    "requires_research": true/false,
+    "requires_credentials": true/false,
+    "missing_information": ["list of missing info"],
+    "suggested_next_steps": ["list of next actions"],
+    "reasoning": "your detailed reasoning process"
+}}"""
+    
+    @staticmethod
+    def create_research_prompt(user_message: str, intent_analysis: IntentAnalysis, 
+                              context: Dict[str, Any] = None) -> str:
+        """Create a research-focused prompt for Tavily integration."""
+        context_str = ""
+        if context:
+            context_items = [f"{k}: {v}" for k, v in context.items() if v]
+            if context_items:
+                context_str = f"\n\nUser Context:\n" + "\n".join(context_items)
+        
+        return f"""You are a research specialist for Malaysian government services. Based on the intent analysis, research the specific process.
+
+USER REQUEST: "{user_message}"
+INTENT ANALYSIS: {intent_analysis.reasoning}{context_str}
+
+Research Requirements:
+1. **Target Website Identification**:
+   - Find the official website(s) for this service
+   - Verify the correct URL and service path
+   - Identify any portal or login requirements
+   
+2. **Process Documentation**:
+   - Find step-by-step instructions
+   - Identify required forms or documents
+   - Understand payment methods and requirements
+   
+3. **Prerequisites and Requirements**:
+   - What credentials are needed (login, IC, etc.)
+   - What information must be provided
+   - Any fees or payment requirements
+   
+4. **Common Issues and Solutions**:
+   - Typical problems users face
+   - Troubleshooting steps
+   - Alternative approaches if needed
+
+Use the tavily_search tool to research this information. Focus on official government websites and trusted sources.
+
+After research, provide a comprehensive summary in JSON format:
+{{
+    "target_websites": ["list of official websites"],
+    "process_steps": ["step-by-step process"],
+    "required_credentials": ["list of needed credentials"],
+    "required_information": ["list of needed information"],
+    "research_confidence": 0.95,
+    "research_summary": "detailed summary of findings"
+}}"""
+    
+    @staticmethod
+    def create_delegation_prompt(intent_analysis: IntentAnalysis, research_results: ResearchResults,
+                               user_message: str, context: Dict[str, Any] = None) -> str:
+        """Create a delegation prompt for passing to validator agent."""
+        context_str = ""
+        if context:
+            context_items = [f"{k}: {v}" for k, v in context.items() if v]
+            if context_items:
+                context_str = f"\n\nUser Context:\n" + "\n".join(context_items)
+        
+        return f"""You are coordinating a Malaysian government service request. Based on your analysis and research, prepare instructions for the Validator Agent.
+
+USER REQUEST: "{user_message}"
+INTENT: {intent_analysis.intent_type} - {intent_analysis.service_category}
+CONFIDENCE: {intent_analysis.confidence_score}{context_str}
+
+RESEARCH FINDINGS:
+{research_results.research_summary}
+
+VALIDATION REQUIREMENTS:
+1. **URL Validation**:
+   - Verify target websites are correct and accessible
+   - Check if URLs lead to the right service pages
+   - Validate SSL certificates and security
+   
+2. **Process Validation**:
+   - Verify the step-by-step process is complete
+   - Check for any missing steps or information
+   - Validate credential requirements
+   
+3. **Automation Readiness**:
+   - Determine if this can be automated
+   - Identify potential automation challenges
+   - Plan micro-step breakdown for Nova Act
+
+4. **Missing Information**:
+   - Identify what still needs to be requested from user
+   - Plan credential collection if needed
+   - Determine human intervention requirements
+
+Provide clear instructions for the Validator Agent to process this request."""
 
 
 class DynamoDBMemoryManager:
@@ -71,11 +246,11 @@ class DynamoDBMemoryManager:
             return False
     
     async def get_conversation_history(self, session_id: str, limit: int = 10) -> List[Dict]:
-        """Retrieve conversation history for context from the chat messages table."""
+        """Retrieve conversation history for context from the crewai-memory table."""
         try:
             from boto3.dynamodb.conditions import Key
             
-            response = self.messages_table.query(
+            response = self.table.query(
                 KeyConditionExpression=Key('session_id').eq(session_id),
                 ScanIndexForward=True,  # Oldest first for conversation flow
                 Limit=limit
@@ -99,22 +274,22 @@ class DynamoDBMemoryManager:
                             return value.get('S', value.get('N', default))
                         return str(value) if value is not None else default
                     
-                    role = safe_get(item, 'role')
-                    content = safe_get(item, 'content')
+                    user_message = safe_get(item, 'user_message')
+                    agent_response = safe_get(item, 'agent_response')
                     timestamp = safe_get(item, 'timestamp')
-                    created_at = safe_get(item, 'created_at')
+                    user_id = safe_get(item, 'user_id')
                     
                     # Convert DynamoDB format to our expected format
                     conv_item = {
-                        'user_message': content if role == 'user' else '',
-                        'agent_response': content if role == 'assistant' else '',
-                        'role': role,
+                        'user_message': user_message,
+                        'agent_response': agent_response,
+                        'role': 'conversation',  # Combined user/agent conversation
                         'timestamp': timestamp,
-                        'created_at': created_at
+                        'user_id': user_id
                     }
                     
-                    # Only add if it's a user or assistant message
-                    if conv_item['role'] in ['user', 'assistant']:
+                    # Only add if there's actual content
+                    if conv_item['user_message'] or conv_item['agent_response']:
                         conversation_history.append(conv_item)
                         logger.debug(f"Added conversation item: {conv_item}")
                         
@@ -221,18 +396,17 @@ class DynamoDBMemoryManager:
 
 
 class CoordinatorAgent:
-    """Intelligent coordinator agent using CrewAI with LLM-based reasoning."""
+    """Enhanced coordinator agent with chain-of-thought prompting and 3-agent architecture support."""
     
     def __init__(self):
-        # Initialize LLM with conservative settings for rate limiting
+        # Initialize LLM with enhanced settings for reasoning
         self.llm = self._initialize_llm()
         
         # Initialize memory manager
         self.memory_manager = DynamoDBMemoryManager()
         
-        # Initialize CrewAI memory components (simplified - no ChromaDB)
-        self.short_term_memory = None
-        self.entity_memory = None
+        # Initialize chain-of-thought prompting utilities
+        self.cot_prompting = ChainOfThoughtPrompting()
         
         # Initialize tools
         try:
@@ -241,24 +415,35 @@ class CoordinatorAgent:
             logger.warning(f"Failed to initialize Tavily tool: {str(e)}")
             self.tavily_tool = None
         
-        # Initialize stagehand agent as sub-agent
-        self.stagehand_agent = GovernmentServicesAgent()
+        # Initialize stagehand agent for direct delegation (temporary)
         
-        # Create specialist web automation agent
-        self.web_automation_agent = self._create_web_automation_agent()
+        # Initialize validator agent
+        self.validator_agent = validator_agent
         
-        # Initialize main coordinator agent with memory and delegation
-        self.main_agent = self._create_main_agent()
+        # Initialize automation agent
+        self.automation_agent = automation_agent
         
-        # Rate limiting - increased interval to prevent AWS throttling
+        # Initialize Nova Act agent
+        self.nova_act_agent = nova_act_agent
+        
+        # Initialize coordinator agent with enhanced prompting
+        self.main_agent = self._create_enhanced_agent()
+        
+        # Initialize intent detection agent
+        self.intent_agent = self._create_intent_agent()
+        
+        # Initialize research agent
+        self.research_agent = self._create_research_agent()
+        
+        # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 3.0  # 3 seconds between requests
+        self.min_request_interval = 3.0
         
         # Request tracking
         self.request_count = 0
         self.successful_requests = 0
         
-        logger.info("Intelligent coordinator agent with memory initialized successfully")
+        logger.info("Enhanced coordinator agent with chain-of-thought prompting initialized successfully")
     
     def _create_short_term_memory(self) -> None:
         """Create short-term memory for recent conversation context."""
@@ -305,82 +490,84 @@ class CoordinatorAgent:
                 model="bedrock/amazon.nova-lite-v1:0",
                 aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
                 aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-                aws_region_name=os.getenv('AWS_DEFAULT_REGION', 'ap-southeast-2'),
+                aws_region_name=os.getenv('BEDROCK_REGION', 'ap-southeast-2'),  # Use Bedrock region
                 stream=True  # Enable streaming for real-time responses
             )
         except Exception as e:
             logger.error(f"Failed to initialize LLM: {str(e)}")
             raise
     
-    def _create_main_agent(self) -> Agent:
-        """Create the main intelligent coordinator agent with LLM-based reasoning and delegation."""
+    def _create_enhanced_agent(self) -> Agent:
+        """Create the enhanced coordinator agent with chain-of-thought capabilities."""
         tools = [self.tavily_tool] if self.tavily_tool else []
         
         return Agent(
-            role="Malaysian Government Service Manager",
-            goal="Coordinate and execute Malaysian government service requests using intelligent delegation to specialized agents",
+            role="Malaysian Government Service Coordinator",
+            goal="Intelligently coordinate Malaysian government service requests using chain-of-thought reasoning and dynamic intent detection",
             backstory=(
-                "You are an intelligent coordinator for Malaysian government services. You understand user requests, "
-                "analyze what needs to be done, and delegate tasks to the appropriate specialist agents. "
-                "You have access to a web automation specialist who can handle browser tasks like logging into "
-                "government portals, filling forms, and extracting data.\n\n"
+                "You are an advanced coordinator for Malaysian government services with enhanced reasoning capabilities. "
+                "You use chain-of-thought prompting to deeply understand user requests and dynamically detect their intent "
+                "without relying on predefined categories. You think step-by-step to analyze requests, determine "
+                "information needs, and coordinate with specialist agents.\n\n"
                 
-                "Your process:\n"
-                "1. Understand the user's government service request\n"
-                "2. Determine what information is needed\n"
-                "3. If you have enough information, delegate browser automation tasks to the web specialist\n"
-                "4. If you need more information, ask the user directly\n"
-                "5. Coordinate the overall process and provide updates\n\n"
+                "Your enhanced process:\n"
+                "1. **Intent Detection**: Use chain-of-thought reasoning to analyze user requests\n"
+                "2. **Research Coordination**: Delegate research tasks when needed using Tavily\n"
+                "3. **Information Gathering**: Identify and request missing information or credentials\n"
+                "4. **Task Delegation**: Coordinate with Validator and Automation agents\n"
+                "5. **Process Monitoring**: Track progress and handle escalations\n\n"
                 
-                "You can handle any Malaysian government service including JPJ, LHDN, JPN, EPF, MyEG, and more."
+                "You excel at understanding complex government service requests and breaking them down into "
+                "manageable tasks for specialist agents while maintaining context and ensuring accuracy."
             ),
             tools=tools,
             llm=self.llm,
             memory=False,
             verbose=True,
-            allow_delegation=True,  # Enable delegation to specialist agents
-            reasoning=True,  # Enable LLM-based reasoning
-            max_reasoning_attempts=3,  # Limit reasoning attempts
-            max_iter=10,  # Allow more iterations for complex coordination
-            max_execution_time=600  # 10 minute timeout for complex tasks
+            allow_delegation=True,
+            max_iter=15,
+            max_execution_time=900
         )
     
-    def _create_web_automation_agent(self) -> Agent:
-        """Create a specialist web automation agent for browser tasks."""
+    def _create_intent_agent(self) -> Agent:
+        """Create a specialized agent for intent detection using chain-of-thought reasoning."""
         return Agent(
-            role="Web Automation Specialist",
-            goal="Execute browser automation tasks for Malaysian government portals with precision and efficiency",
+            role="Intent Analysis Specialist",
+            goal="Analyze user requests using chain-of-thought reasoning to dynamically detect intent and requirements",
             backstory=(
-                "You are an expert web automation specialist for Malaysian government services. "
-                "You excel at navigating complex government portals and performing precise browser actions.\n\n"
-                
-                "Your expertise includes:\n"
-                "- MyEG portal navigation and summons checking\n"
-                "- JPJ services (summons, licenses, vehicle registration)\n"
-                "- LHDN tax services and e-filing\n"
-                "- JPN identity services\n"
-                "- EPF and SOCSO services\n"
-                "- Other Malaysian government e-services\n\n"
-                
-                "When you receive delegation from the coordinator:\n"
-                "1. Follow the specific instructions exactly\n"
-                "2. Use natural language commands for browser actions\n"
-                "3. Navigate step by step through the process\n"
-                "4. Extract and report all relevant information found\n"
-                "5. Handle any errors or issues encountered\n\n"
-                
-                "You work independently and efficiently, reporting back detailed results to the coordinator."
+                "You are a specialist in understanding user intent for Malaysian government services. "
+                "You use advanced reasoning techniques to analyze requests without relying on predefined categories. "
+                "You think step-by-step to understand what users really want and what they need to accomplish "
+                "their goals. You excel at identifying missing information and determining the best next steps."
             ),
-            tools=[self.stagehand_agent.stagehand_tool],
             llm=self.llm,
             memory=False,
             verbose=True,
-            allow_delegation=False,  # Specialist doesn't delegate further
-            reasoning=True,  # Enable reasoning for complex tasks
-            max_reasoning_attempts=2,
-            max_iter=20,  # Allow more iterations for complex browser tasks
-            max_execution_time=600  # 10 minute timeout for complex tasks
+            max_iter=5,
+            max_execution_time=300
         )
+    
+    def _create_research_agent(self) -> Agent:
+        """Create a specialized agent for research using Tavily integration."""
+        tools = [self.tavily_tool] if self.tavily_tool else []
+        
+        return Agent(
+            role="Government Service Research Specialist",
+            goal="Research Malaysian government services using web search to gather accurate process information",
+            backstory=(
+                "You are a research specialist focused on Malaysian government services. "
+                "You use web search to find accurate, up-to-date information about government processes, "
+                "requirements, and procedures. You focus on official government websites and trusted sources "
+                "to ensure the information you provide is reliable and current."
+            ),
+            tools=tools,
+            llm=self.llm,
+            memory=False,
+            verbose=True,
+            max_iter=8,
+            max_execution_time=600
+        )
+    
     
     async def process_user_request(self, user_message: str, user_context: Dict[str, Any] = None, 
                                  session_id: str = None, user_id: str = None) -> Dict[str, Any]:
@@ -421,7 +608,8 @@ class CoordinatorAgent:
                 user_message, 
                 user_context or {},
                 conversation_history,
-                user_entity_memory
+                user_entity_memory,
+                session_id
             )
             
             # Save conversation to memory if session_id provided
@@ -454,84 +642,421 @@ class CoordinatorAgent:
     
     async def _intelligent_process_request(self, user_message: str, user_context: Dict[str, Any], 
                                          conversation_history: List[Dict] = None, 
-                                         user_entity_memory: Dict = None) -> Dict[str, Any]:
+                                         user_entity_memory: Dict = None,
+                                         session_id: str = None) -> Dict[str, Any]:
         """
-        Process user request using LLM-based reasoning with proper delegation to specialist agents.
+        Enhanced request processing using chain-of-thought reasoning and 3-agent architecture.
         """
         try:
-            # Build memory context string
-            memory_context = ""
-            if conversation_history:
-                memory_context += f"\nCONVERSATION HISTORY:\n"
-                for i, conv in enumerate(conversation_history[-5:]):  # Last 5 messages
-                    if conv.get('role') == 'user':
-                        memory_context += f"User: {conv.get('user_message', conv.get('content', ''))}\n"
-                    elif conv.get('role') == 'assistant':
-                        memory_context += f"Assistant: {conv.get('agent_response', conv.get('content', ''))}\n"
-                memory_context += "\n"
+            # Build memory context
+            memory_context = self._build_memory_context(conversation_history, user_entity_memory)
             
-            if user_entity_memory:
-                memory_context += f"USER ENTITY MEMORY: {user_entity_memory.get('memory_data', {})}\n\n"
+            # Step 1: Intent Detection using Chain-of-Thought
+            intent_analysis = await self._detect_intent(user_message, user_context, memory_context)
             
-            # Create a task with explicit delegation instructions
-            processing_task = Task(
-                description=(
-                    f"USER REQUEST: '{user_message}'\n"
-                    f"USER CONTEXT: {user_context}\n\n"
-                    f"{memory_context}"
-                    
-                    f"CRITICAL INSTRUCTIONS:\n"
-                    f"=====================\n\n"
-                    
-                    f"For transportation summons payment requests:\n"
-                    f"- IC number and plate number are SUFFICIENT to proceed\n"
-                    f"- DO NOT ask for summons number or amount - these will be found during the process\n"
-                    f"- IMMEDIATELY delegate to Web Automation Specialist with these instructions:\n"
-                    f"  'Go to MyEG website, log in, navigate to traffic summons section, "
-                    f"  enter IC number {user_context.get('ic_number', 'provided IC')} and plate number {user_context.get('plate_number', 'provided plate')}, "
-                    f"  find and display all summons for payment'\n\n"
-                    
-                    f"For other government services:\n"
-                    f"- If you have IC number, credentials, or other essential info, delegate immediately\n"
-                    f"- Only ask for more info if truly essential information is missing\n\n"
-                    
-                    f"DELEGATION RULES:\n"
-                    f"- ALWAYS delegate browser tasks to Web Automation Specialist\n"
-                    f"- Be specific about what the specialist should do\n"
-                    f"- Don't ask users for information you can find through automation\n\n"
-                    
-                    f"RESPONSE FORMAT:\n"
-                    f"- If delegating: 'I'll help you with that. Let me delegate this to our web automation specialist.'\n"
-                    f"- If need info: Ask specifically what's missing and why\n"
-                    f"- If not government service: Explain you only help with Malaysian government services"
-                ),
-                expected_output="Clear response with appropriate delegation or information request",
-                agent=self.main_agent
+            # Step 2: Early Exit for Casual Greetings and Non-Government Requests
+            if self._is_casual_greeting_or_non_government_request(intent_analysis, user_message):
+                return await self._handle_casual_request(intent_analysis, user_message, memory_context)
+            
+            # Step 3: Research if needed
+            research_results = None
+            if intent_analysis.requires_research:
+                research_results = await self._conduct_research(user_message, intent_analysis, user_context, memory_context)
+            
+            # Step 4: Handle missing information
+            if intent_analysis.missing_information:
+                return await self._handle_missing_information(intent_analysis, research_results)
+            
+            # Step 5: Validate task flow using Validator Agent (only for government service requests)
+            validation_result = await self.validator_agent.validate_task_flow(
+                coordinator_instructions="",
+                intent_analysis=intent_analysis.__dict__,
+                research_results=research_results.__dict__ if research_results else None
             )
             
-            # Create sequential crew where coordinator can delegate to web automation agent
-            processing_crew = Crew(
-                agents=[self.main_agent, self.web_automation_agent],
-                tasks=[processing_task],
-                process=Process.sequential,  # Sequential process allows delegation
-                verbose=True
-            )
+            # Step 6: Prepare for delegation to Automation Agent
+            delegation_instructions = await self._prepare_delegation(intent_analysis, research_results, validation_result, user_message, user_context)
             
-            result = processing_crew.kickoff()
+            # Step 7: Execute automation task using Automation Agent
+            automation_task = {
+                'delegation_instructions': delegation_instructions,
+                'micro_steps': validation_result.micro_steps,
+                'error_handling_plan': validation_result.error_handling_plan,
+                'monitoring_points': validation_result.monitoring_points,
+                'user_context': user_context,
+                'intent_analysis': intent_analysis.__dict__,
+                'research_results': research_results.__dict__ if research_results else None,
+                'validation_result': validation_result.__dict__
+            }
             
-            # Return the result as a successful response
+            # Stage 1: Generate execution plan using Automation Agent
+            logger.info("Stage 1: Generating execution plan with Automation Agent...")
+            execution_plan_result = self.automation_agent.generate_execution_plan(automation_task)
+            
+            if execution_plan_result["status"] != "success":
+                logger.error(f"Failed to generate execution plan: {execution_plan_result['message']}")
+                return {
+                    "status": "error",
+                    "message": f"Failed to generate automation plan: {execution_plan_result['message']}",
+                    "intent_analysis": intent_analysis,
+                    "research_results": research_results,
+                    "validation_result": validation_result,
+                    "requires_human": True
+                }
+            
+            # Stage 2: Execute the plan using Nova Act Agent
+            logger.info("Stage 2: Executing plan with Nova Act Agent...")
+            execution_plan = execution_plan_result["execution_plan"]
+            automation_result = await self.nova_act_agent.execute_execution_plan(execution_plan)
+            
+            result = automation_result
+            
             return {
-                "status": "success",
-                "message": str(result),
-                "requires_human": False
+                "status": result.get("status", "success"),
+                "message": result.get("message", "Automation completed successfully"),
+                "intent_analysis": intent_analysis,
+                "research_results": research_results,
+                "validation_result": validation_result,
+                "automation_result": result,
+                "requires_human": result.get("requires_human", False)
             }
                 
         except Exception as e:
-            logger.error(f"Intelligent processing failed: {str(e)}")
+            logger.error(f"Enhanced processing failed: {str(e)}")
             return {
                 "status": "error",
                 "message": f"I encountered an issue processing your request: {str(e)}. Please try again.",
                 "requires_human": True
+            }
+    
+    def _build_memory_context(self, conversation_history: List[Dict] = None, 
+                            user_entity_memory: Dict = None) -> str:
+        """Build memory context string from conversation history and entity memory."""
+        memory_context = ""
+        
+        if conversation_history:
+            memory_context += f"\nCONVERSATION HISTORY:\n"
+            for i, conv in enumerate(conversation_history[-5:]):  # Last 5 messages
+                if conv.get('role') == 'user':
+                    memory_context += f"User: {conv.get('user_message', conv.get('content', ''))}\n"
+                elif conv.get('role') == 'assistant':
+                    memory_context += f"Assistant: {conv.get('agent_response', conv.get('content', ''))}\n"
+            memory_context += "\n"
+        
+        if user_entity_memory:
+            memory_context += f"USER ENTITY MEMORY: {user_entity_memory.get('memory_data', {})}\n\n"
+            
+        return memory_context
+    
+    def _is_casual_greeting_or_non_government_request(self, intent_analysis: IntentAnalysis, user_message: str) -> bool:
+        """
+        Determine if the request is a casual greeting or non-government request that should be handled directly.
+        """
+        # Check intent analysis results
+        if (intent_analysis.intent_type == "other" and 
+            intent_analysis.service_category == "other" and
+            intent_analysis.confidence_score < 0.7):
+            return True
+        
+        # Check for common casual greeting patterns
+        casual_patterns = [
+            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+            "how are you", "how do you do", "what's up", "how's it going",
+            "thank you", "thanks", "bye", "goodbye", "see you later"
+        ]
+        
+        message_lower = user_message.lower().strip()
+        
+        # Direct match for casual greetings
+        if message_lower in casual_patterns:
+            return True
+        
+        # Check if message starts with casual greeting
+        for pattern in casual_patterns:
+            if message_lower.startswith(pattern):
+                return True
+        
+        # Check for very short, non-specific messages
+        if len(user_message.strip()) < 10 and not any(keyword in message_lower for keyword in 
+            ["jpj", "lhdn", "jpn", "epf", "myeg", "government", "pay", "summons", "license", "ic"]):
+            return True
+        
+        return False
+    
+    async def _handle_casual_request(self, intent_analysis: IntentAnalysis, user_message: str, memory_context: str) -> Dict[str, Any]:
+        """
+        Handle casual greetings and non-government requests with appropriate responses.
+        """
+        message_lower = user_message.lower().strip()
+        
+        # Determine appropriate response based on the message
+        if any(greeting in message_lower for greeting in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
+            response = "Hello! I'm doing well, thank you for asking. I'm here to help you with Malaysian government service requests. How can I assist you today?"
+        
+        elif "how are you" in message_lower or "how do you do" in message_lower:
+            response = "I'm doing great! I'm here to assist you with Malaysian government services. What can I help you with today?"
+        
+        elif any(thanks in message_lower for thanks in ["thank you", "thanks"]):
+            response = "You're very welcome! I'm happy to help with your Malaysian government service needs. Is there anything else I can assist you with?"
+        
+        elif any(bye in message_lower for bye in ["bye", "goodbye", "see you later"]):
+            response = "Goodbye! Feel free to come back anytime if you need help with Malaysian government services. Have a great day!"
+        
+        elif "what's up" in message_lower or "how's it going" in message_lower:
+            response = "Everything's going well! I'm ready to help you with any Malaysian government service requests. What do you need assistance with?"
+        
+        else:
+            # Generic response for other casual messages
+            response = "Hello! I'm here to assist you with Malaysian government service requests. If you need help with services like JPJ, LHDN, JPN, EPF, or MyEG, just let me know what you'd like to do!"
+        
+        return {
+            "status": "success",
+            "message": response,
+            "intent_analysis": intent_analysis,
+            "research_results": None,
+            "validation_result": None,
+            "requires_human": False,
+            "response_type": "casual_greeting"
+        }
+    
+    async def _detect_intent(self, user_message: str, user_context: Dict[str, Any], 
+                           memory_context: str) -> IntentAnalysis:
+        """Detect user intent using chain-of-thought reasoning."""
+        try:
+            # Create chain-of-thought prompt
+            prompt = self.cot_prompting.create_intent_detection_prompt(user_message, user_context)
+            
+            # Create intent detection task
+            intent_task = Task(
+                description=prompt,
+                expected_output="JSON response with intent analysis including reasoning",
+                agent=self.intent_agent
+            )
+            
+            # Execute intent detection
+            intent_crew = Crew(
+                agents=[self.intent_agent],
+                tasks=[intent_task],
+                process=Process.sequential,
+                verbose=True
+            )
+            
+            result = intent_crew.kickoff()
+            
+            # Parse the JSON response
+            intent_data = self._parse_intent_response(str(result))
+            
+            # Create IntentAnalysis object
+            return IntentAnalysis(
+                intent_type=intent_data.get('intent_type', 'unknown'),
+                service_category=intent_data.get('service_category', 'unknown'),
+                confidence_score=float(intent_data.get('confidence_score', 0.0)),
+                requires_research=bool(intent_data.get('requires_research', False)),
+                requires_credentials=bool(intent_data.get('requires_credentials', False)),
+                missing_information=intent_data.get('missing_information', []),
+                suggested_next_steps=intent_data.get('suggested_next_steps', []),
+                reasoning=intent_data.get('reasoning', '')
+            )
+            
+        except Exception as e:
+            logger.error(f"Intent detection failed: {str(e)}")
+            # Return default intent analysis
+            return IntentAnalysis(
+                intent_type='unknown',
+                service_category='unknown',
+                confidence_score=0.0,
+                requires_research=True,
+                requires_credentials=False,
+                missing_information=['Unable to analyze intent'],
+                suggested_next_steps=['Please provide more details'],
+                reasoning=f'Intent detection failed: {str(e)}'
+            )
+    
+    async def _conduct_research(self, user_message: str, intent_analysis: IntentAnalysis, 
+                              user_context: Dict[str, Any], memory_context: str) -> ResearchResults:
+        """Conduct research using Tavily integration."""
+        try:
+            # Create research prompt
+            prompt = self.cot_prompting.create_research_prompt(user_message, intent_analysis, user_context)
+            
+            # Create research task
+            research_task = Task(
+                description=prompt,
+                expected_output="JSON response with research findings and process details",
+                agent=self.research_agent
+            )
+            
+            # Execute research
+            research_crew = Crew(
+                agents=[self.research_agent],
+                tasks=[research_task],
+                process=Process.sequential,
+                verbose=True
+            )
+            
+            result = research_crew.kickoff()
+            
+            # Parse the JSON response
+            research_data = self._parse_research_response(str(result))
+            
+            # Create ResearchResults object
+            return ResearchResults(
+                target_websites=research_data.get('target_websites', []),
+                process_steps=research_data.get('process_steps', []),
+                required_credentials=research_data.get('required_credentials', []),
+                required_information=research_data.get('required_information', []),
+                research_confidence=float(research_data.get('research_confidence', 0.0)),
+                research_summary=research_data.get('research_summary', '')
+            )
+            
+        except Exception as e:
+            logger.error(f"Research failed: {str(e)}")
+            # Return default research results
+            return ResearchResults(
+                target_websites=[],
+                process_steps=[],
+                required_credentials=[],
+                required_information=[],
+                research_confidence=0.0,
+                research_summary=f'Research failed: {str(e)}'
+            )
+    
+    async def _handle_missing_information(self, intent_analysis: IntentAnalysis, 
+                                        research_results: ResearchResults = None) -> Dict[str, Any]:
+        """Handle requests that need additional information from the user."""
+        missing_info = intent_analysis.missing_information
+        
+        # Build response message
+        response_parts = []
+        response_parts.append("I understand you want to proceed with this government service request.")
+        
+        if research_results and research_results.research_summary:
+            response_parts.append(f"\nBased on my research: {research_results.research_summary}")
+        
+        if missing_info:
+            response_parts.append("\nTo proceed, I need the following information:")
+            for info in missing_info:
+                response_parts.append(f"• {info}")
+        
+        if intent_analysis.requires_credentials:
+            response_parts.append("\nI will also need your login credentials for the relevant government portal.")
+        
+        response_parts.append("\nPlease provide this information so I can assist you with your request.")
+        
+        return {
+            "status": "information_required",
+            "message": "\n".join(response_parts),
+            "missing_information": missing_info,
+            "requires_credentials": intent_analysis.requires_credentials,
+            "intent_analysis": intent_analysis,
+            "research_results": research_results,
+                "requires_human": False
+            }
+                
+    async def _prepare_delegation(self, intent_analysis: IntentAnalysis, 
+                                research_results: ResearchResults,
+                                validation_result, user_message: str, user_context: Dict[str, Any]) -> str:
+        """Prepare delegation instructions for the Automation Agent."""
+        # Create enhanced delegation prompt with validation results
+        prompt = f"""
+You are coordinating a Malaysian government service request. Based on your analysis, research, and validation, prepare instructions for the Automation Agent.
+
+USER REQUEST: "{user_message}"
+INTENT: {intent_analysis.intent_type} - {intent_analysis.service_category}
+CONFIDENCE: {intent_analysis.confidence_score}
+
+RESEARCH FINDINGS:
+{research_results.research_summary if research_results else 'No research conducted'}
+
+VALIDATION RESULTS:
+Status: {validation_result.validation_status}
+Confidence: {validation_result.confidence_score}
+Details: {validation_result.validation_details}
+
+MICRO-STEPS PREPARED:
+{len(validation_result.micro_steps)} micro-steps have been prepared for automation
+
+AUTOMATION INSTRUCTIONS:
+1. Execute the prepared micro-steps in sequence
+2. Monitor each step for success/failure
+3. Handle errors according to the error handling plan
+4. Escalate to human intervention if needed
+
+Provide clear, actionable instructions for the Automation Agent to execute this government service request.
+"""
+        
+        # Create delegation task
+        delegation_task = Task(
+            description=prompt,
+            expected_output="Clear instructions for the Automation Agent to execute the government service request",
+            agent=self.main_agent
+        )
+        
+        # Execute delegation preparation
+        delegation_crew = Crew(
+            agents=[self.main_agent],
+            tasks=[delegation_task],
+            process=Process.sequential,
+            verbose=True
+        )
+        
+        result = delegation_crew.kickoff()
+        return str(result)
+    
+    def _parse_intent_response(self, response_text: str) -> Dict[str, Any]:
+        """Parse intent detection response from JSON."""
+        try:
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                return json.loads(json_str)
+            else:
+                # Fallback parsing
+                return self._fallback_parse_intent(response_text)
+        except Exception as e:
+            logger.error(f"Failed to parse intent response: {str(e)}")
+            return self._fallback_parse_intent(response_text)
+    
+    def _parse_research_response(self, response_text: str) -> Dict[str, Any]:
+        """Parse research response from JSON."""
+        try:
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                return json.loads(json_str)
+            else:
+                # Fallback parsing
+                return self._fallback_parse_research(response_text)
+        except Exception as e:
+            logger.error(f"Failed to parse research response: {str(e)}")
+            return self._fallback_parse_research(response_text)
+    
+    def _fallback_parse_intent(self, response_text: str) -> Dict[str, Any]:
+        """Fallback parsing for intent response."""
+        return {
+            'intent_type': 'unknown',
+            'service_category': 'unknown',
+            'confidence_score': 0.5,
+            'requires_research': True,
+            'requires_credentials': False,
+            'missing_information': ['Unable to parse intent'],
+            'suggested_next_steps': ['Manual analysis required'],
+            'reasoning': response_text[:500]
+        }
+    
+    def _fallback_parse_research(self, response_text: str) -> Dict[str, Any]:
+        """Fallback parsing for research response."""
+        return {
+            'target_websites': [],
+            'process_steps': [],
+            'required_credentials': [],
+            'required_information': [],
+            'research_confidence': 0.5,
+            'research_summary': response_text[:500]
             }
     
     def get_health_status(self) -> Dict[str, Any]:
@@ -547,42 +1072,11 @@ class CoordinatorAgent:
             "llm_model": "bedrock/amazon.nova-lite-v1:0"
         }
     
-    async def execute_automation_task(self, automation_task: Dict[str, Any], session_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Execute automation task using the stagehand agent.
-        
-        Args:
-            automation_task: Task prepared for automation
-            session_id: Session ID for human interaction (optional)
-            
-        Returns:
-            Result dictionary with status and details
-        """
-        try:
-            logger.info(f"Executing automation task with stagehand agent: {automation_task.get('task_type', 'unknown')}")
-            
-            # Delegate to stagehand agent for browser automation
-            result = self.stagehand_agent.execute_government_task(automation_task)
-            
-            return {
-                "status": "success",
-                "message": "Task completed successfully",
-                "details": result,
-                "requires_human": False
-            }
-            
-        except Exception as e:
-            logger.error(f"Stagehand automation task execution failed: {str(e)}")
-            return {
-                "status": "error",
-                "message": f"Automation execution failed: {str(e)}",
-                "requires_human": True
-            }
     
     async def process_complete_request(self, user_message: str, user_context: Dict[str, Any] = None, 
                                      session_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Process complete user request including automation execution with memory.
+        Process complete user request with CrewAI delegation handling everything internally.
         
         Args:
             user_message: User's message/request
@@ -594,28 +1088,11 @@ class CoordinatorAgent:
             Complete response dictionary
         """
         try:
-            # First, process the request through coordinator with memory
-            coordinator_result = await self.process_user_request(
+            # Process the request through coordinator with CrewAI delegation
+            # The coordinator now handles delegation internally via CrewAI
+            return await self.process_user_request(
                 user_message, user_context, session_id, user_id
             )
-            
-            # If ready for automation, execute it
-            if coordinator_result.get("status") == "ready_for_automation":
-                automation_task = coordinator_result.get("automation_task", {})
-                automation_result = await self.execute_automation_task(automation_task, session_id)
-                
-                # Combine results
-                return {
-                    "status": automation_result.get("status", "error"),
-                    "message": automation_result.get("message", "Automation completed"),
-                    "details": automation_result.get("details", ""),
-                    "requires_human": automation_result.get("requires_human", True),
-                    "coordinator_result": coordinator_result,
-                    "automation_result": automation_result
-                }
-            else:
-                # Return coordinator result if not ready for automation
-                return coordinator_result
                 
         except Exception as e:
             logger.error(f"Complete request processing failed: {str(e)}")
