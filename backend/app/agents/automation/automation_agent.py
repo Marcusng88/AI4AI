@@ -1374,7 +1374,7 @@ class AutomationAgent:
 - No payment is required for checking
 
 ## Troubleshooting Tips:
-{chr(10).join(f"- {suggestion}" for suggestion in suggestions) if suggestions else "- Ensure your internet connection is stable\n- Try refreshing the page if it doesn't load\n- Double-check your IC number format"}
+{chr(10).join(f"- {suggestion}" for suggestion in suggestions) if suggestions else "- Ensure your internet connection is stable" + chr(10) + "- Try refreshing the page if it doesn't load" + chr(10) + "- Double-check your IC number format"}
 
 ## If you need help:
 - Check MyEG's help section or FAQ

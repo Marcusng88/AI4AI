@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     jpn_base_url: str = "https://www.jpn.gov.my"
     epf_base_url: str = "https://www.kwsp.gov.my"
     
+    # CORS Configuration
+    cors_origins: str = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://localhost:3000")
+    
     # External APIs
     tavily_api_key: Optional[str] = None
     crawl4ai_api_key: Optional[str] = None

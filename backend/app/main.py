@@ -70,9 +70,26 @@ app = FastAPI(
 app.add_middleware(AuthMiddleware)
 
 # CORS middleware
+def get_cors_origins():
+    """Get CORS origins from environment variable."""
+    if settings.debug:
+        return ["*"]
+    
+    # Parse CORS origins from environment variable
+    origins = settings.cors_origins.split(",")
+    # Strip whitespace and filter out empty strings
+    origins = [origin.strip() for origin in origins if origin.strip()]
+    
+    # Add default CloudFront URL if not already present
+    default_cloudfront = "https://d84l1y8p4kdic.cloudfront.net"
+    if default_cloudfront not in origins:
+        origins.append(default_cloudfront)
+    
+    return origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.debug else ["https://your-frontend-domain.com", "https://d84l1y8p4kdic.cloudfront.net"],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
