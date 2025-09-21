@@ -27,10 +27,12 @@ const amplifyConfig = {
           domain: 'ap-southeast-5nuc0or8va.auth.ap-southeast-5.amazoncognito.com',
           scopes: ['email','openid', 'profile'],
           redirectSignIn: [
-            'http://localhost:3000/auth/callback'
+            'http://localhost:3000/auth/callback',
+            'https://main.d1b9r86a05ypmd.amplifyapp.com/auth/callback'
           ],
           redirectSignOut: [
-            'http://localhost:3000'
+            'http://localhost:3000',
+            'https://main.d1b9r86a05ypmd.amplifyapp.com'
           ],
           responseType: 'code' as const
         }

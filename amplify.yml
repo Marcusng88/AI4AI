@@ -1,0 +1,19 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - corepack enable          # ensures pnpm is available
+        - pnpm install --frozen-lockfile --prefix frontend
+    build:
+      commands:
+        - pnpm --dir frontend run build
+  artifacts:
+    baseDirectory: frontend/.next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - 'frontend/node_modules/**/*'
+      - 'frontend/.next/cache/**/*'
+      - 'frontend/pnpm-lock.yaml'

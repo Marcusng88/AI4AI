@@ -4,12 +4,18 @@ import type React from "react"
 
 import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { useAuth } from "@/hooks/use-auth"
 import { useChatApi } from "@/hooks/use-chat-api"
 import { useBrowserViewer } from "@/hooks/use-browser-viewer"
 import { ConversationList } from "./conversation-list"
 import { BrowserPanel } from "@/components/browser/browser-panel"
-import { Plus, Settings, LogOut, Menu, X, Eye, ChevronLeft, ChevronRight } from "lucide-react"
+import { Plus, Settings, LogOut, Menu, X, Eye, ChevronLeft, ChevronRight, ChevronDown } from "lucide-react"
 
 interface ChatLayoutProps {
   children: React.ReactNode
@@ -165,12 +171,20 @@ export function ChatLayout({ children, currentSessionId }: ChatLayoutProps) {
             </div>
             {!isSidebarCollapsed && (
               <div className="flex space-x-1">
-                <Button variant="ghost" size="sm" title="Settings">
-                  <Settings className="h-4 w-4" />
-                </Button>
-                <Button variant="ghost" size="sm" onClick={handleSignOut} title="Sign Out">
-                  <LogOut className="h-4 w-4" />
-                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm" title="Settings" className="flex items-center gap-1">
+                      <Settings className="h-4 w-4" />
+                      <ChevronDown className="h-3 w-3" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48">
+                    <DropdownMenuItem onClick={handleSignOut} className="cursor-pointer">
+                      <LogOut className="h-4 w-4 mr-2" />
+                      Sign Out
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
             )}
           </div>
