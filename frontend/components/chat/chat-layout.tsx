@@ -100,7 +100,7 @@ export function ChatLayout({ children, currentSessionId }: ChatLayoutProps) {
         {/* Header - Fixed */}
         <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
           {!isSidebarCollapsed && (
-            <h1 className="text-lg font-semibold">AI Chat</h1>
+            <h1 className="text-lg font-semibold">AI4AI</h1>
           )}
           <div className="flex items-center gap-2">
             <Button 

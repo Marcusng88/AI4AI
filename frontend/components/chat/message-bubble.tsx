@@ -18,6 +18,10 @@ export function MessageBubble({ message, isUser, timestamp, metadata }: MessageB
   const browserViewer = metadata?.browser_viewer
   const hasBrowserViewer = browserViewer?.is_available && browserViewer?.live_url
 
+  // Check if this message contains tutorial content
+  const tutorial = metadata?.tutorial
+  const hasTutorial = tutorial && tutorial.length > 0
+
   const handleShowBrowser = () => {
     if (browserViewer?.live_url) {
       // Dispatch event to show browser panel instead of using the hook directly
@@ -42,6 +46,21 @@ export function MessageBubble({ message, isUser, timestamp, metadata }: MessageB
         )}
       >
         <p className="text-sm leading-relaxed whitespace-pre-wrap">{message}</p>
+        
+        {/* Tutorial Content */}
+        {!isUser && hasTutorial && (
+          <div className="mt-3 pt-3 border-t border-border">
+            <div className="bg-blue-50 dark:bg-blue-950/20 rounded-lg p-4">
+              <h4 className="font-semibold text-blue-900 dark:text-blue-100 mb-2">📚 Tutorial Guide</h4>
+              <div 
+                className="text-sm text-blue-800 dark:text-blue-200 prose prose-sm max-w-none"
+                dangerouslySetInnerHTML={{ 
+                  __html: tutorial.replace(/\n/g, '<br/>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\*(.*?)\*/g, '<em>$1</em>')
+                }}
+              />
+            </div>
+          </div>
+        )}
         
         {/* Browser Viewer Button */}
         {!isUser && hasBrowserViewer && (

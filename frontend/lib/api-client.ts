@@ -266,6 +266,12 @@ class ApiClient {
       metadata: {
         chat_response: chatResponse,
         status: chatResponse.status,
+        // Pass tutorial content if present
+        ...(chatResponse.tutorial && { tutorial: chatResponse.tutorial }),
+        // Pass any other response fields that might be useful
+        ...(chatResponse.requires_human !== undefined && { requires_human: chatResponse.requires_human }),
+        ...(chatResponse.details && { details: chatResponse.details }),
+        ...(chatResponse.error && { error: chatResponse.error }),
       },
     })
 

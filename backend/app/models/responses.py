@@ -10,6 +10,7 @@ class ResponseStatus(str, Enum):
     SUCCESS = "success"
     ERROR = "error"
     PARTIAL = "partial"
+    TUTORIAL = "tutorial"
 
 
 class ChatResponse(BaseModel):
@@ -20,6 +21,8 @@ class ChatResponse(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
     payment_links: Optional[List[str]] = Field(None, description="Payment links if applicable")
     screenshots: Optional[List[str]] = Field(None, description="Screenshot URLs if applicable")
+    tutorial: Optional[str] = Field(None, description="Tutorial content if applicable")
+    requires_human: Optional[bool] = Field(None, description="Whether human interaction is required")
 
 
 class GovernmentServiceResponse(BaseModel):

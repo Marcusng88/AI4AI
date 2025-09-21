@@ -654,8 +654,8 @@ class CoordinatorAgent:
             # Step 1: Intent Detection using Chain-of-Thought
             intent_analysis = await self._detect_intent(user_message, user_context, memory_context)
             
-            # Step 2: Early Exit for Casual Greetings and Non-Government Requests
-            if self._is_casual_greeting_or_non_government_request(intent_analysis, user_message):
+            # Step 2: AI-Driven Decision Making for Request Handling
+            if self._should_handle_directly(intent_analysis, user_message):
                 return await self._handle_casual_request(intent_analysis, user_message, memory_context)
             
             # Step 3: Research if needed
@@ -667,23 +667,28 @@ class CoordinatorAgent:
             if intent_analysis.missing_information:
                 return await self._handle_missing_information(intent_analysis, research_results)
             
-            # Step 5: Validate task flow using Validator Agent (only for government service requests)
+            # Step 5: Extract credentials from user message for automation
+            extracted_credentials = await self._extract_credentials_from_message(user_message, user_context)
+            
+            # Step 6: Validate task flow using Validator Agent (only for government service requests)
             validation_result = await self.validator_agent.validate_task_flow(
                 coordinator_instructions="",
                 intent_analysis=intent_analysis.__dict__,
                 research_results=research_results.__dict__ if research_results else None
             )
             
-            # Step 6: Prepare for delegation to Automation Agent
+            # Step 7: Prepare for delegation to Automation Agent
             delegation_instructions = await self._prepare_delegation(intent_analysis, research_results, validation_result, user_message, user_context)
             
-            # Step 7: Execute automation task using Automation Agent
+            # Step 8: Execute automation task using Automation Agent with extracted credentials
             automation_task = {
                 'delegation_instructions': delegation_instructions,
                 'micro_steps': validation_result.micro_steps,
                 'error_handling_plan': validation_result.error_handling_plan,
                 'monitoring_points': validation_result.monitoring_points,
                 'user_context': user_context,
+                'user_message': user_message,  # Pass user message directly
+                'extracted_credentials': extracted_credentials,  # Pass extracted credentials
                 'intent_analysis': intent_analysis.__dict__,
                 'research_results': research_results.__dict__ if research_results else None,
                 'validation_result': validation_result.__dict__
@@ -707,19 +712,110 @@ class CoordinatorAgent:
             # Stage 2: Execute the plan using Nova Act Agent
             logger.info("Stage 2: Executing plan with Nova Act Agent...")
             execution_plan = execution_plan_result["execution_plan"]
-            automation_result = await self.nova_act_agent.execute_execution_plan(execution_plan)
+            nova_act_result = self.nova_act_agent.execute_execution_plan(execution_plan)
             
-            result = automation_result
-            
-            return {
-                "status": result.get("status", "success"),
-                "message": result.get("message", "Automation completed successfully"),
-                "intent_analysis": intent_analysis,
-                "research_results": research_results,
-                "validation_result": validation_result,
-                "automation_result": result,
-                "requires_human": result.get("requires_human", False)
+            # Stage 3: Process Nova Act result and determine next action
+            logger.info("Stage 3: Processing Nova Act result...")
+            automation_task = {
+                "task_description": automation_task.get("task_description", ""),
+                "target_website": execution_plan.get("target_website", ""),
+                "validation_result": validation_result
             }
+            
+            processed_result = self.automation_agent.process_nova_act_result(nova_act_result, automation_task)
+            
+            # Handle different actions based on processed result
+            action = processed_result.get("action", "inform_user")
+            
+            if action == "improve_and_retry":
+                # Automation agent has improved the plan, retry with improved execution plan
+                logger.info("Retrying with improved execution plan from automation agent...")
+                
+                improved_execution_plan = processed_result.get("improved_execution_plan")
+                if not improved_execution_plan:
+                    logger.error("No improved execution plan provided by automation agent")
+                    return {
+                        "status": "error",
+                        "message": "Failed to get improved execution plan from automation agent",
+                        "intent_analysis": intent_analysis,
+                        "research_results": research_results,
+                        "validation_result": validation_result,
+                        "nova_act_result": nova_act_result,
+                        "processed_result": processed_result,
+                        "requires_human": True
+                    }
+                
+                # Execute the improved plan with Nova Act Agent
+                logger.info("Executing improved plan with Nova Act Agent...")
+                retry_nova_act_result = self.nova_act_agent.execute_execution_plan(improved_execution_plan)
+                
+                # Process the retry result
+                retry_processed_result = self.automation_agent.process_nova_act_result(retry_nova_act_result, automation_task)
+                
+                # Handle the retry result
+                retry_action = retry_processed_result.get("action", "inform_user")
+                
+                if retry_action == "inform_user":
+                    return {
+                        "status": "success",
+                        "message": "Automation completed successfully after plan improvement!",
+                        "intent_analysis": intent_analysis,
+                        "research_results": research_results,
+                        "validation_result": validation_result,
+                        "nova_act_result": retry_nova_act_result,
+                        "processed_result": retry_processed_result,
+                        "improvement_applied": True,
+                        "requires_human": False
+                    }
+                elif retry_action == "return_tutorial":
+                    return {
+                        "status": "tutorial",
+                        "message": "Automation failed even after plan improvement. Here's a tutorial to help you:",
+                        "tutorial": retry_processed_result.get("tutorial", "No tutorial available"),
+                        "intent_analysis": intent_analysis,
+                        "research_results": research_results,
+                        "validation_result": validation_result,
+                        "nova_act_result": retry_nova_act_result,
+                        "processed_result": retry_processed_result,
+                        "improvement_applied": True,
+                        "requires_human": True
+                    }
+                else:
+                    # If retry also suggests improvement, we'll stop here to avoid infinite loops
+                    logger.warning("Retry also suggests improvement, stopping to avoid infinite loops")
+                    return {
+                        "status": "partial",
+                        "message": "Automation partially completed after one improvement attempt. Further improvement needed.",
+                        "intent_analysis": intent_analysis,
+                        "research_results": research_results,
+                        "validation_result": validation_result,
+                        "nova_act_result": retry_nova_act_result,
+                        "processed_result": retry_processed_result,
+                        "improvement_applied": True,
+                        "requires_human": True
+                    }
+            elif action == "return_tutorial":
+                return {
+                    "status": "tutorial",
+                    "message": processed_result.get("message", "Here's a tutorial to help you:"),
+                    "tutorial": processed_result.get("tutorial", "No tutorial available"),
+                    "intent_analysis": intent_analysis,
+                    "research_results": research_results,
+                    "validation_result": validation_result,
+                    "nova_act_result": nova_act_result,
+                    "requires_human": True
+                }
+            else:  # inform_user
+                return {
+                    "status": processed_result.get("status", "success"),
+                    "message": processed_result.get("message", "Automation completed successfully"),
+                    "intent_analysis": intent_analysis,
+                    "research_results": research_results,
+                    "validation_result": validation_result,
+                    "nova_act_result": nova_act_result,
+                    "processed_result": processed_result,
+                    "requires_human": processed_result.get("requires_human", False)
+                }
                 
         except Exception as e:
             logger.error(f"Enhanced processing failed: {str(e)}")
@@ -748,66 +844,239 @@ class CoordinatorAgent:
             
         return memory_context
     
-    def _is_casual_greeting_or_non_government_request(self, intent_analysis: IntentAnalysis, user_message: str) -> bool:
+    async def _extract_credentials_from_message(self, user_message: str, user_context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Determine if the request is a casual greeting or non-government request that should be handled directly.
+        Extract credentials from user message using AI-powered analysis.
+        
+        Args:
+            user_message: User's natural language message
+            user_context: Additional context information
+            
+        Returns:
+            Dictionary with extracted credentials
         """
-        # Check intent analysis results
-        if (intent_analysis.intent_type == "other" and 
-            intent_analysis.service_category == "other" and
-            intent_analysis.confidence_score < 0.7):
-            return True
+        try:
+            # Create a specialized AI agent for credential extraction
+            credential_agent = self._create_credential_extraction_agent()
+            
+            # Create task for credential extraction
+            task = Task(
+                description=f"""
+                Analyze the following user message and context to extract any credentials or personal information that might be needed for government service automation.
+                
+                USER MESSAGE: "{user_message}"
+                
+                ADDITIONAL CONTEXT: {user_context}
+                
+                CREDENTIAL TYPES TO LOOK FOR:
+                1. Email addresses (login credentials)
+                2. Passwords (login credentials) 
+                3. IC numbers (Malaysian identity card numbers)
+                4. Phone numbers
+                5. Names (full names, usernames)
+                6. Any other personal information that might be needed for authentication
+                
+                EXTRACTION RULES:
+                - Look for Malaysian IC numbers in formats: 123456-12-1234 or 123456121234
+                - Look for email addresses in standard format
+                - Look for phone numbers (Malaysian format preferred)
+                - Extract names and usernames
+                - Be conservative - only extract information that is clearly provided
+                - If information is mentioned but not provided, don't extract it
+                
+                IMPORTANT: Only extract information that is explicitly provided in the message or context. Do not make assumptions.
+                
+                Return your response as a JSON object with the following structure:
+                {{
+                    "email": "extracted email if found",
+                    "password": "extracted password if found", 
+                    "ic_number": "extracted IC number if found",
+                    "phone": "extracted phone number if found",
+                    "name": "extracted name if found",
+                    "confidence": 0.95,
+                    "extraction_notes": "brief notes about what was found"
+                }}
+                
+                If no credentials are found, return an empty object: {{}}
+                """,
+                expected_output="JSON object with extracted credentials or empty object if none found",
+                agent=credential_agent
+            )
+            
+            # Execute the task
+            crew = Crew(
+                agents=[credential_agent],
+                tasks=[task],
+                process=Process.sequential,
+                verbose=False  # Keep quiet for production
+            )
+            
+            result = crew.kickoff()
+            
+            # Parse the JSON response
+            import json
+            import re
+            
+            # Try to extract JSON from the response
+            json_match = re.search(r'\{.*\}', str(result), re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                credentials = json.loads(json_str)
+                
+                # Remove empty values and confidence/notes fields
+                credentials = {k: v for k, v in credentials.items() 
+                             if v and k not in ['confidence', 'extraction_notes']}
+                
+                logger.info(f"Extracted credentials from user message: {list(credentials.keys())}")
+                return credentials
+            else:
+                logger.warning("Could not parse JSON from credential extraction")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Error in credential extraction: {str(e)}")
+            return {}
+    
+    def _create_credential_extraction_agent(self) -> Agent:
+        """Create a specialized AI agent for credential extraction."""
+        return Agent(
+            role="Credential Extraction Specialist",
+            goal="Intelligently extract personal information and credentials from natural language text for government service automation",
+            backstory="""You are an expert at analyzing natural language text to extract personal information and credentials. 
+            You understand various formats of personal information including Malaysian IC numbers, email addresses, 
+            phone numbers, and names. You are conservative in your extraction - only extracting information that is 
+            clearly and explicitly provided. You understand the context of government service automation and know 
+            what types of information are typically needed for authentication and service access.""",
+            verbose=False,
+            allow_delegation=False,
+            llm=self.llm
+        )
+    
+    def _should_handle_directly(self, intent_analysis: IntentAnalysis, user_message: str) -> bool:
+        """
+        Use AI-driven decision making to determine if request should be handled directly.
+        This replaces rule-based logic with intelligent analysis.
+        """
+        # Create an AI agent to make this decision intelligently
+        decision_agent = Agent(
+            role="Request Classification Specialist",
+            goal="Intelligently classify user requests to determine the best handling approach",
+            backstory=(
+                "You are an expert at analyzing user requests and determining whether they should be "
+                "handled directly with a simple response or require deeper processing through the "
+                "government service workflow. You consider context, intent, and user needs."
+            ),
+            llm=self.llm,
+            memory=False,
+            verbose=False,
+            max_iter=3,
+            max_execution_time=30
+        )
         
-        # Check for common casual greeting patterns
-        casual_patterns = [
-            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
-            "how are you", "how do you do", "what's up", "how's it going",
-            "thank you", "thanks", "bye", "goodbye", "see you later"
-        ]
+        # Create a task for intelligent decision making
+        decision_task = Task(
+            description=f"""
+            Analyze this user request and intent analysis to determine if it should be handled directly:
+            
+            USER MESSAGE: "{user_message}"
+            
+            INTENT ANALYSIS:
+            - Type: {intent_analysis.intent_type}
+            - Category: {intent_analysis.service_category}
+            - Confidence: {intent_analysis.confidence_score}
+            - Requires Research: {intent_analysis.requires_research}
+            - Requires Credentials: {intent_analysis.requires_credentials}
+            - Missing Information: {intent_analysis.missing_information}
+            - Reasoning: {intent_analysis.reasoning}
+            
+            DECISION CRITERIA:
+            - Handle directly if: Simple greeting, basic question, or non-government request
+            - Process through workflow if: Government service request, requires research, or needs credentials
+            
+            Respond with only "DIRECT" or "PROCESS" based on your analysis.
+            """,
+            expected_output="Either 'DIRECT' or 'PROCESS'",
+            agent=decision_agent
+        )
         
-        message_lower = user_message.lower().strip()
+        # Execute the decision
+        decision_crew = Crew(
+            agents=[decision_agent],
+            tasks=[decision_task],
+            process=Process.sequential,
+            verbose=False
+        )
         
-        # Direct match for casual greetings
-        if message_lower in casual_patterns:
-            return True
-        
-        # Check if message starts with casual greeting
-        for pattern in casual_patterns:
-            if message_lower.startswith(pattern):
-                return True
-        
-        # Check for very short, non-specific messages
-        if len(user_message.strip()) < 10 and not any(keyword in message_lower for keyword in 
-            ["jpj", "lhdn", "jpn", "epf", "myeg", "government", "pay", "summons", "license", "ic"]):
-            return True
-        
-        return False
+        try:
+            result = decision_crew.kickoff()
+            decision = str(result).strip().upper()
+            logger.info(f"AI Decision for '{user_message}': {decision}")
+            return decision == "DIRECT"
+        except Exception as e:
+            logger.error(f"AI decision making failed: {e}")
+            # Fallback to intent analysis
+            return (intent_analysis.intent_type == "other" and 
+                   intent_analysis.service_category == "other" and
+                   intent_analysis.confidence_score < 0.5)
     
     async def _handle_casual_request(self, intent_analysis: IntentAnalysis, user_message: str, memory_context: str) -> Dict[str, Any]:
         """
-        Handle casual greetings and non-government requests with appropriate responses.
+        Handle casual greetings and non-government requests with intelligent AI-driven responses.
         """
-        message_lower = user_message.lower().strip()
+        # Create an AI agent for intelligent casual response generation
+        casual_agent = Agent(
+            role="Friendly Government Service Assistant",
+            goal="Provide warm, helpful responses to casual greetings while guiding users toward government services",
+            backstory=(
+                "You are a friendly and professional assistant for Malaysian government services. "
+                "You respond warmly to casual greetings while naturally guiding users toward "
+                "government service assistance. You're helpful, knowledgeable, and encouraging."
+            ),
+            llm=self.llm,
+            memory=False,
+            verbose=False,
+            max_iter=2,
+            max_execution_time=20
+        )
         
-        # Determine appropriate response based on the message
-        if any(greeting in message_lower for greeting in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
-            response = "Hello! I'm doing well, thank you for asking. I'm here to help you with Malaysian government service requests. How can I assist you today?"
+        # Create a task for intelligent response generation
+        response_task = Task(
+            description=f"""
+            Generate a warm, helpful response to this user message. The user seems to be making casual conversation.
+            
+            USER MESSAGE: "{user_message}"
+            INTENT ANALYSIS: {intent_analysis.reasoning}
+            
+            GUIDELINES:
+            - Be warm and friendly
+            - Acknowledge their message appropriately
+            - Gently guide them toward government service assistance
+            - Keep it conversational but professional
+            - If they mentioned government services (even casually), acknowledge that interest
+            - Keep response concise (1-2 sentences)
+            
+            Generate a natural, helpful response.
+            """,
+            expected_output="A warm, helpful response that acknowledges the user and guides them toward government services",
+            agent=casual_agent
+        )
         
-        elif "how are you" in message_lower or "how do you do" in message_lower:
-            response = "I'm doing great! I'm here to assist you with Malaysian government services. What can I help you with today?"
+        # Execute the response generation
+        response_crew = Crew(
+            agents=[casual_agent],
+            tasks=[response_task],
+            process=Process.sequential,
+            verbose=False
+        )
         
-        elif any(thanks in message_lower for thanks in ["thank you", "thanks"]):
-            response = "You're very welcome! I'm happy to help with your Malaysian government service needs. Is there anything else I can assist you with?"
-        
-        elif any(bye in message_lower for bye in ["bye", "goodbye", "see you later"]):
-            response = "Goodbye! Feel free to come back anytime if you need help with Malaysian government services. Have a great day!"
-        
-        elif "what's up" in message_lower or "how's it going" in message_lower:
-            response = "Everything's going well! I'm ready to help you with any Malaysian government service requests. What do you need assistance with?"
-        
-        else:
-            # Generic response for other casual messages
-            response = "Hello! I'm here to assist you with Malaysian government service requests. If you need help with services like JPJ, LHDN, JPN, EPF, or MyEG, just let me know what you'd like to do!"
+        try:
+            result = response_crew.kickoff()
+            response = str(result).strip()
+            logger.info(f"Generated casual response: {response}")
+        except Exception as e:
+            logger.error(f"AI response generation failed: {e}")
+            # Fallback response
+            response = "Hello! I'm here to assist you with Malaysian government service requests. How can I help you today?"
         
         return {
             "status": "success",

@@ -12,7 +12,6 @@ from urllib.parse import quote_plus
 import requests
 import jwt
 from jose import jwk, jwt as jose_jwt
-from jose.utils import base64url_decode
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 

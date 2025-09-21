@@ -7,7 +7,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from app.config import settings
-from app.routers import health, chat, agents, auth, websocket
+from app.routers import health, chat, auth, websocket, browser
 from app.core.logging import setup_logging
 from app.middleware.auth_middleware import AuthMiddleware
 
@@ -29,25 +29,31 @@ async def lifespan(app: FastAPI):
         print("   To fix: Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.")
     
     # Initialize services
-    from app.services.agent_service import AgentService
     from app.agents.coordinator.coordinator_agent import coordinator_agent
-    from app.agents.automation.automation_agent import automation_agent
+    from app.agents.automation.automation_agent import automation_agent    
     
-    agent_service = AgentService()
-    agent_service.register_agent_instance("coordinator", coordinator_agent)
-    agent_service.register_agent_instance("automation", automation_agent)
+    print("🚀 Application startup completed")
     
-    # Store in app state for access in routes
-    app.state.agent_service = agent_service
-    
+    # Yield control to FastAPI - this is where the app runs
     yield
     
     # Shutdown
+    print("🔄 Starting application shutdown...")
+    
     # Clean up browser sessions
     try:
         await automation_agent.close_browser()
+    except KeyboardInterrupt:
+        print("Shutdown interrupted by user (KeyboardInterrupt)")
+        # Still try to close browsers even if interrupted
+        try:
+            await automation_agent.close_browser()
+        except Exception as cleanup_error:
+            print(f"Error during cleanup after interrupt: {cleanup_error}")
     except Exception as e:
         print(f"Error closing browser session: {e}")
+    
+    print("✅ Application shutdown completed")
 
 
 # Create FastAPI application
@@ -76,7 +82,7 @@ app.add_middleware(
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(auth.router, prefix="/api/v1", tags=["Authentication"])
 app.include_router(chat.router, prefix="/api/v1", tags=["Chat"])
-app.include_router(agents.router, prefix="/api/v1", tags=["Agents"])
+app.include_router(browser.router, prefix="/api/v1/browser", tags=["Browser"])
 app.include_router(websocket.router, tags=["WebSocket"])
 
 

@@ -92,6 +92,28 @@ class ConnectionManager:
         }
         await self.send_to_session(message, session_id)
     
+    async def broadcast_live_view_available(self, session_id: str, live_view_url: str, presigned_url: str = None):
+        """Broadcast that live view streaming is available."""
+        message = {
+            "type": "live_view_available",
+            "session_id": session_id,
+            "live_view_url": live_view_url,
+            "presigned_url": presigned_url,
+            "streaming_enabled": True
+        }
+        await self.send_to_session(message, session_id)
+    
+    async def broadcast_browser_session_created(self, session_id: str, ws_url: str, headers: dict):
+        """Broadcast that a browser session has been created."""
+        message = {
+            "type": "browser_session_created",
+            "session_id": session_id,
+            "ws_url": ws_url,
+            "headers": headers,
+            "status": "active"
+        }
+        await self.send_to_session(message, session_id)
+    
     async def broadcast_control_event(self, session_id: str, event_type: str, user_id: str = None):
         """Broadcast control events (take_control, release_control)."""
         message = {

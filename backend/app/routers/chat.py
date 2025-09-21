@@ -9,6 +9,7 @@ from app.models.requests import ChatRequest, AddMessageRequest
 from app.models.responses import ChatResponse, ResponseStatus
 from app.services.chat_service import ChatService
 from app.services.dynamodb_service import dynamodb_service
+from app.core.logging import logger
 
 router = APIRouter()
 
@@ -32,13 +33,26 @@ async def chat_with_agent(request: ChatRequest, fastapi_request: Request):
             user_context=request.user_context
         )
         
+        # Determine response status
+        response_status = response.get("status", "error")
+        if response_status == "tutorial":
+            status = ResponseStatus.TUTORIAL
+        elif response_status == "success":
+            status = ResponseStatus.SUCCESS
+        elif response_status == "partial":
+            status = ResponseStatus.PARTIAL
+        else:
+            status = ResponseStatus.ERROR
+        
         return ChatResponse(
             message=response["message"],
             session_id=session_id,
-            status=ResponseStatus.SUCCESS if response.get("status") != "error" else ResponseStatus.ERROR,
+            status=status,
             metadata=response.get("metadata"),
             payment_links=response.get("payment_links", []),
-            screenshots=response.get("screenshots", [])
+            screenshots=response.get("screenshots", []),
+            tutorial=response.get("tutorial"),
+            requires_human=response.get("requires_human")
         )
         
     except Exception as e:
@@ -70,12 +84,24 @@ async def get_chat_history(session_id: str, fastapi_request: Request):
 
 
 @router.delete("/chat/sessions/{session_id}")
-async def clear_chat_session(session_id: str, fastapi_request: Request):
+async def clear_chat_session(session_id: str, user_id: str = None, fastapi_request: Request = None):
     """Clear chat session history."""
     try:
         # Initialize chat service
         chat_service = ChatService()
-        await chat_service.clear_session(session_id)
+        
+        # Try to get user_id from request if not provided
+        if not user_id and fastapi_request:
+            # Extract user_id from request headers or query params
+            user_id = fastapi_request.headers.get("X-User-ID") or fastapi_request.query_params.get("user_id")
+        
+        success = await chat_service.clear_session(session_id, user_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot clear session without user_id. Please provide user_id as query parameter."
+            )
         
         return {
             "message": "Session cleared successfully",
@@ -83,6 +109,8 @@ async def clear_chat_session(session_id: str, fastapi_request: Request):
             "timestamp": datetime.utcnow().isoformat()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -220,6 +248,7 @@ async def update_session(user_id: str, session_id: str, title: Optional[str] = N
 async def delete_session(user_id: str, session_id: str):
     """Delete a session and all its messages."""
     try:
+        logger.info(f"DELETE request for session {session_id} by user {user_id}")
         success = await dynamodb_service.delete_session(user_id, session_id)
         if not success:
             raise HTTPException(

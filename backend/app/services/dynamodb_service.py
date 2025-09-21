@@ -138,7 +138,7 @@ class DynamoDBService:
                     'KeyType': 'HASH'
                 },
                 {
-                    'AttributeName': 'timestamp',
+                    'AttributeName': 'created_at',
                     'KeyType': 'RANGE'
                 }
             ],
@@ -148,8 +148,8 @@ class DynamoDBService:
                     'AttributeType': 'S'
                 },
                 {
-                    'AttributeName': 'timestamp',
-                    'AttributeType': 'N'
+                    'AttributeName': 'created_at',
+                    'AttributeType': 'S'
                 }
             ],
             'BillingMode': 'PAY_PER_REQUEST'
@@ -273,16 +273,15 @@ class DynamoDBService:
     
     async def add_message(self, session_id: str, role: str, content: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """Add a message to a session."""
-        timestamp = int(datetime.utcnow().timestamp() * 1000)  # Milliseconds for better sorting
+        created_at = datetime.utcnow().isoformat()
         message_id = str(uuid.uuid4())
         
         message_data = {
             'session_id': {'S': session_id},
-            'timestamp': {'N': str(timestamp)},
+            'created_at': {'S': created_at},
             'message_id': {'S': message_id},
             'role': {'S': role},  # 'user', 'assistant', 'system'
-            'content': {'S': content},
-            'created_at': {'S': datetime.utcnow().isoformat()}
+            'content': {'S': content}
         }
         
         if metadata:
@@ -300,10 +299,9 @@ class DynamoDBService:
             return {
                 'message_id': message_id,
                 'session_id': session_id,
-                'timestamp': timestamp,
                 'role': role,
                 'content': content,
-                'created_at': message_data['created_at']['S'],
+                'created_at': created_at,
                 'metadata': metadata
             }
             
@@ -321,7 +319,7 @@ class DynamoDBService:
                     'ExpressionAttributeValues': {
                         ':session_id': {'S': session_id}
                     },
-                    'ScanIndexForward': True,  # Sort by timestamp ascending (oldest first)
+                    'ScanIndexForward': True,  # Sort by created_at ascending (oldest first)
                     'Limit': limit
                 }
                 
@@ -332,7 +330,6 @@ class DynamoDBService:
                 message = {
                     'message_id': item['message_id']['S'],
                     'session_id': item['session_id']['S'],
-                    'timestamp': int(item['timestamp']['N']),
                     'role': item['role']['S'],
                     'content': item['content']['S'],
                     'created_at': item['created_at']['S']
@@ -385,6 +382,16 @@ class DynamoDBService:
     async def delete_session(self, user_id: str, session_id: str) -> bool:
         """Delete a session and all its messages."""
         try:
+            # Validate inputs
+            if not user_id or not isinstance(user_id, str):
+                logger.error(f"Invalid user_id: {user_id} (type: {type(user_id)})")
+                return False
+            if not session_id or not isinstance(session_id, str):
+                logger.error(f"Invalid session_id: {session_id} (type: {type(session_id)})")
+                return False
+                
+            logger.info(f"Deleting session {session_id} for user {user_id}")
+            
             async with await self.get_async_client() as client:
                 # First, get all messages for this session
                 messages_response = await client.query(
@@ -397,22 +404,36 @@ class DynamoDBService:
                 
                 # Delete all messages
                 for item in messages_response.get('Items', []):
-                    await client.delete_item(
-                        TableName=self.messages_table,
-                        Key={
+                    try:
+                        delete_key = {
                             'session_id': {'S': session_id},
-                            'timestamp': item['timestamp']
+                            'created_at': {'S': item['created_at']['S']}
                         }
-                    )
+                        logger.debug(f"Deleting message with key: {delete_key}")
+                        await client.delete_item(
+                            TableName=self.messages_table,
+                            Key=delete_key
+                        )
+                    except Exception as e:
+                        logger.error(f"Error deleting message: {e}")
+                        logger.error(f"Message item: {item}")
+                        raise
                 
                 # Delete the session
-                await client.delete_item(
-                    TableName=self.sessions_table,
-                    Key={
+                try:
+                    session_delete_key = {
                         'user_id': {'S': user_id},
                         'session_id': {'S': session_id}
                     }
-                )
+                    logger.debug(f"Deleting session with key: {session_delete_key}")
+                    await client.delete_item(
+                        TableName=self.sessions_table,
+                        Key=session_delete_key
+                    )
+                except Exception as e:
+                    logger.error(f"Error deleting session: {e}")
+                    logger.error(f"Session delete key: {session_delete_key}")
+                    raise
             
             logger.info(f"Deleted session {session_id} and all messages")
             return True

@@ -1,219 +1,263 @@
 """
 Nova Act Agent for browser automation using AWS Bedrock Agent Core Browser.
-This agent operates separately from the automation agent and executes Nova Act instructions
-on the agentcore browser with advanced monitoring and error handling.
+This agent executes Nova Act instructions directly with BOOL_SCHEMA error detection
+and structured output for CrewAI integration.
 """
 
-import asyncio
-from typing import Dict, Any, Optional, List
-from datetime import datetime
 import os
 import time
-import threading
+import asyncio
 import concurrent.futures
-from dataclasses import dataclass
-import json
+from typing import Dict, Any, Optional, List
+from datetime import datetime
 
-from nova_act import NovaAct
-from bedrock_agentcore.tools.browser_client import BrowserClient
+from nova_act import NovaAct, BOOL_SCHEMA
+from bedrock_agentcore.tools.browser_client import browser_session
 
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-@dataclass
 class NovaActExecutionResult:
     """Data class for Nova Act execution results."""
-    instruction: str
-    status: str  # "success", "failed", "timeout", "blackhole_detected"
-    result_text: str
-    error_message: Optional[str]
-    execution_time: float
-    retry_count: int
-    browser_state: Dict[str, Any]
+    def __init__(self, instruction: str, status: str, result_text: str, 
+                 error_message: str = None, execution_time: float = 0.0, 
+                 retry_count: int = 0, browser_state: Dict[str, Any] = None):
+        self.instruction = instruction
+        self.status = status  # "success", "failed", "timeout", "blackhole_detected"
+        self.result_text = result_text
+        self.error_message = error_message
+        self.execution_time = execution_time
+        self.retry_count = retry_count
+        self.browser_state = browser_state or {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "instruction": self.instruction,
+            "status": self.status,
+            "result_text": self.result_text,
+            "error_message": self.error_message,
+            "execution_time": self.execution_time,
+            "retry_count": self.retry_count,
+            "browser_state": self.browser_state
+        }
 
 
-@dataclass
-class NovaActSession:
-    """Data class for Nova Act session tracking."""
-    session_id: str
-    start_time: datetime
-    browser_client: BrowserClient
-    nova_act: NovaAct
-    current_instruction: str
-    execution_history: List[NovaActExecutionResult]
-    status: str  # "active", "paused", "blackhole_detected", "completed", "failed"
-    blackhole_detection_count: int
-    consecutive_failures: int
+class NovaActErrorDetection:
+    """Data class for error detection results."""
+    def __init__(self, has_difficulties: bool, is_stuck_in_loop: bool, can_proceed: bool,
+                 error_type: str = None, suggestions: List[str] = None):
+        self.has_difficulties = has_difficulties
+        self.is_stuck_in_loop = is_stuck_in_loop
+        self.can_proceed = can_proceed
+        self.error_type = error_type
+        self.suggestions = suggestions or []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "has_difficulties": self.has_difficulties,
+            "is_stuck_in_loop": self.is_stuck_in_loop,
+            "can_proceed": self.can_proceed,
+            "error_type": self.error_type,
+            "suggestions": self.suggestions
+        }
+
+
+class NovaActExecutionSummary:
+    """Data class for complete execution summary."""
+    def __init__(self, status: str, message: str, session_id: str, 
+                 completed_steps: List[NovaActExecutionResult], 
+                 failed_step: NovaActExecutionResult = None,
+                 error_detection: NovaActErrorDetection = None,
+                 success_count: int = 0, failed_count: int = 0,
+                 requires_human: bool = False, suggestions: List[str] = None):
+        self.status = status  # "success", "partial", "failed", "error"
+        self.message = message
+        self.session_id = session_id
+        self.completed_steps = completed_steps
+        self.failed_step = failed_step
+        self.error_detection = error_detection
+        self.success_count = success_count
+        self.failed_count = failed_count
+        self.requires_human = requires_human
+        self.suggestions = suggestions or []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary (replaces Pydantic model_dump)."""
+        return {
+            "status": self.status,
+            "message": self.message,
+            "session_id": self.session_id,
+            "completed_steps": [step.to_dict() for step in self.completed_steps],
+            "failed_step": self.failed_step.to_dict() if self.failed_step else None,
+            "error_detection": self.error_detection.to_dict() if self.error_detection else None,
+            "success_count": self.success_count,
+            "failed_count": self.failed_count,
+            "requires_human": self.requires_human,
+            "suggestions": self.suggestions
+        }
 
 
 class NovaActAgent:
-    """Nova Act agent for browser automation with advanced monitoring."""
+    """Nova Act agent for browser automation with intelligent error detection."""
     
     def __init__(self):
         # Configuration
         self.nova_act_api_key = os.getenv("NOVA_ACT_API_KEY")
         self.aws_region = "us-east-1"
-        self.iam_role_arn = os.getenv("IAM_ROLE_ARN", "arn:aws:iam::791493234575:role/BedrockAgentCoreBrowserRole")
         
-        # AWS credentials
-        self.aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-        self.aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-        
-        # Session tracking
-        self.active_sessions: Dict[str, NovaActSession] = {}
-        
-        # Blackhole detection configuration
-        self.max_consecutive_failures = 3
-        self.max_similar_errors = 5
-        self.blackhole_timeout_seconds = 300  # 5 minutes
-        
-        logger.info("Nova Act agent initialized successfully")
+        logger.info("Nova Act agent initialized successfully with direct execution")
     
-    async def create_session(self, starting_page: str = "https://www.myeg.com.my", session_id: Optional[str] = None) -> str:
-        """
-        Create a new Nova Act session with browser client.
-        
-        Args:
-            starting_page: URL to start the browser session
-            session_id: Optional session ID
-            
-        Returns:
-            Session ID for the created session
-        """
+    def _check_asyncio_context(self) -> bool:
+        """Check if we're running in an asyncio event loop."""
         try:
-            session_id = session_id or f"nova_act_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-            
-            # Initialize browser client
-            browser_client = await self._initialize_browser_client()
-            if not browser_client:
-                raise Exception("Failed to initialize browser client")
-            
-            # Initialize Nova Act
-            nova_act = await self._initialize_nova_act(browser_client, starting_page)
-            if not nova_act:
-                raise Exception("Failed to initialize Nova Act")
-            
-            # Create session
-            session = NovaActSession(
-                session_id=session_id,
-                start_time=datetime.utcnow(),
-                browser_client=browser_client,
-                nova_act=nova_act,
-                current_instruction="",
-                execution_history=[],
-                status="active",
-                blackhole_detection_count=0,
-                consecutive_failures=0
-            )
-            
-            self.active_sessions[session_id] = session
-            logger.info(f"Created Nova Act session {session_id} with starting page: {starting_page}")
-            
-            return session_id
-            
-        except Exception as e:
-            logger.error(f"Failed to create Nova Act session: {str(e)}")
-            raise
+            loop = asyncio.get_running_loop()
+            logger.warning(f"🚨 DIAGNOSTIC: Nova Act called from asyncio loop: {loop}")
+            logger.warning(f"   This will cause Playwright Sync API to fail!")
+            logger.warning(f"   Loop is running: {loop.is_running()}")
+            return True
+        except RuntimeError:
+            logger.info("✅ DIAGNOSTIC: Nova Act called from sync context - safe!")
+            return False
     
-    async def execute_instruction(self, session_id: str, instruction: str, 
-                                timeout_seconds: int = 60) -> NovaActExecutionResult:
-        """
-        Execute a Nova Act instruction in the specified session.
-        
-        Args:
-            session_id: Session ID
-            instruction: Nova Act instruction to execute
-            timeout_seconds: Timeout for execution
-            
-        Returns:
-            Nova Act execution result
-        """
+    def _execute_nova_act_sync(self, execution_plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute Nova Act in synchronous context (for thread isolation)."""
         try:
-            if session_id not in self.active_sessions:
-                raise Exception(f"Session {session_id} not found")
+            # Extract plan details
+            task_description = execution_plan.get('task_description', 'Automation task')
+            session_id = execution_plan.get('session_id', f"session_{int(time.time())}")
+            target_website = execution_plan.get('target_website', 'https://www.myeg.com.my')
+            micro_steps = execution_plan.get('micro_steps', [])
+            credentials = execution_plan.get('credentials', {})
             
-            session = self.active_sessions[session_id]
+            logger.info(f"Executing automation plan: {task_description}")
+            logger.info(f"Target website: {target_website}")
+            logger.info(f"Micro-steps count: {len(micro_steps)}")
             
-            if session.status != "active":
-                raise Exception(f"Session {session_id} is not active (status: {session.status})")
-            
-            logger.info(f"Executing Nova Act instruction in session {session_id}: {instruction[:50]}...")
-            
-            # Update session state
-            session.current_instruction = instruction
-            
-            # Execute instruction with timeout
-            start_time = time.time()
-            result = await self._execute_with_timeout(session, instruction, timeout_seconds)
-            execution_time = time.time() - start_time
-            
-            # Parse result
-            result_text = ""
-            error_message = None
-            status = "success"
-            
-            if hasattr(result, 'response') and result.response:
-                result_text = str(result.response)
-            elif hasattr(result, 'parsed_response') and result.parsed_response:
-                result_text = str(result.parsed_response)
-            else:
-                result_text = str(result)
-            
-            # Check for errors
-            if hasattr(result, 'error') and result.error:
-                error_message = str(result.error)
-                status = "failed"
-            elif "error" in result_text.lower() or "failed" in result_text.lower():
-                error_message = result_text
-                status = "failed"
-            
-            # Check for blackhole detection
-            if self._detect_blackhole(session, instruction, result_text, error_message):
-                status = "blackhole_detected"
-                session.status = "blackhole_detected"
-                session.blackhole_detection_count += 1
-                logger.warning(f"Blackhole detected in session {session_id}")
-            
-            # Create execution result
-            execution_result = NovaActExecutionResult(
-                instruction=instruction,
-                status=status,
-                result_text=result_text,
-                error_message=error_message,
-                execution_time=execution_time,
-                retry_count=0,
-                browser_state=self._get_browser_state(session)
-            )
-            
-            # Update session
-            session.execution_history.append(execution_result)
-            if status == "failed":
-                session.consecutive_failures += 1
-            else:
-                session.consecutive_failures = 0
-            
-            logger.info(f"Nova Act instruction completed in {execution_time:.2f}s with status: {status}")
-            
-            return execution_result
-            
+            # Start fresh session each time
+            with browser_session(self.aws_region) as client:
+                ws_url, headers = client.generate_ws_headers()
+                
+                # # Create and start the BrowserViewerServer to get live view URL
+                # # This is the correct pattern from AWS documentation
+                # viewer_server = None
+                # live_view_url = None
+                
+                # try:
+                #     # Import BrowserViewerServer from our implementation
+                #     # Following the exact pattern from AWS official samples
+                #     from .browser_viewer import BrowserViewerServer
+                    
+                #     # Create BrowserViewerServer instance
+                #     viewer_server = BrowserViewerServer(client, port=8000)
+                    
+                #     # Start the viewer server and get the live view URL
+                #     # According to AWS docs: viewer.start() returns the viewer_url
+                #     live_view_url = viewer_server.start(open_browser=False)
+                    
+                #     if live_view_url:
+                #         logger.info(f"Live view URL available: {live_view_url}")
+                        
+                #         # Register the session with the browser router
+                #         from app.routers.browser import register_browser_session
+                #         register_browser_session(session_id, live_view_url)
+                        
+                #         # Broadcast live view availability via WebSocket
+                #         from app.routers.websocket import manager
+                #         import asyncio
+                        
+                #         # Helper function to safely broadcast async messages
+                #         def safe_broadcast(coro):
+                #             try:
+                #                 loop = asyncio.get_event_loop()
+                #                 if loop.is_running():
+                #                     # Create a task if we're already in an event loop
+                #                     asyncio.create_task(coro)
+                #                 else:
+                #                     loop.run_until_complete(coro)
+                #             except RuntimeError:
+                #                 # No event loop, create one
+                #                 asyncio.run(coro)
+                        
+                #         # Broadcast live view availability via WebSocket
+                #         safe_broadcast(manager.broadcast_live_view_available(
+                #             session_id, live_view_url
+                #         ))
+                        
+                #         # Also broadcast browser viewer ready event
+                #         safe_broadcast(manager.broadcast_browser_viewer_ready(
+                #             session_id, live_view_url, True, True
+                #         ))
+                #     else:
+                #         logger.warning("BrowserViewerServer did not return a live view URL")
+                        
+                # except ImportError:
+                #     logger.error("BrowserViewerServer not available. Please ensure the interactive_tools module is properly installed.")
+                # except Exception as e:
+                #     logger.warning(f"Could not start BrowserViewerServer: {e}")
+                
+                # Initialize Nova Act with the browser session (following Context7 pattern exactly)
+                with NovaAct(
+                    cdp_endpoint_url=ws_url,
+                    cdp_headers=headers,
+                    nova_act_api_key=self.nova_act_api_key,
+                    starting_page=target_website,
+                ) as nova_act:
+                    
+                    # Execute micro-steps with error detection and credentials
+                    execution_summary = self._execute_steps_with_error_detection(
+                        nova_act, micro_steps, session_id, credentials
+                    )
+                    
+                    # Convert to dictionary for return
+                    result = execution_summary.to_dict()
+                    
+                    # # Clean up the viewer server when done
+                    # if viewer_server:
+                    #     try:
+                    #         viewer_server.stop()
+                    #         logger.info("BrowserViewerServer stopped successfully")
+                    #     except Exception as e:
+                    #         logger.warning(f"Error stopping BrowserViewerServer: {e}")
+                    
+                    return result
+                    
+        except KeyboardInterrupt:
+            logger.warning("Nova Act execution interrupted by user (KeyboardInterrupt)")
+            return {
+                'status': 'interrupted',
+                'message': 'Execution was interrupted by user',
+                'session_id': execution_plan.get('session_id', 'unknown'),
+                'completed_steps': [],
+                'failed_step': None,
+                'error_detection': None,
+                'success_count': 0,
+                'failed_count': 1,
+                'requires_human': True,
+                'suggestions': ['Execution was interrupted, please try again']
+            }
         except Exception as e:
-            logger.error(f"Failed to execute Nova Act instruction: {str(e)}")
-            return NovaActExecutionResult(
-                instruction=instruction,
-                status="failed",
-                result_text="",
-                error_message=str(e),
-                execution_time=0.0,
-                retry_count=0,
-                browser_state={}
-            )
+            logger.error(f"Failed to execute Nova Act plan: {str(e)}")
+            return {
+                'status': 'error',
+                'message': f'Execution failed: {str(e)}',
+                'session_id': execution_plan.get('session_id', 'unknown'),
+                'completed_steps': [],
+                'failed_step': None,
+                'error_detection': None,
+                'success_count': 0,
+                'failed_count': 1,
+                'requires_human': True,
+                'suggestions': ['Check browser connection and try again']
+            }
     
-    async def execute_execution_plan(self, execution_plan: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_execution_plan(self, execution_plan: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a complete automation execution plan from the automation agent.
-        Uses the correct browser_session context manager pattern.
+        Uses thread isolation to avoid asyncio/Playwright conflicts.
         
         Args:
             execution_plan: Complete execution plan from automation agent
@@ -221,477 +265,420 @@ class NovaActAgent:
         Returns:
             Dictionary with execution results
         """
-        try:
-            # Extract plan details
-            session_id = execution_plan.get('session_id', f"nova_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
-            task_description = execution_plan.get('task_description', '')
-            target_website = execution_plan.get('target_website', 'https://www.myeg.com.my')
-            micro_steps = execution_plan.get('micro_steps', [])
-            execution_strategy = execution_plan.get('execution_strategy', 'sequential')
+        # Check if we're in an asyncio context
+        is_async_context = self._check_asyncio_context()
+        
+        if is_async_context:
+            # Run in separate thread to avoid asyncio/Playwright conflict
+            logger.info("🔄 Running Nova Act in separate thread to avoid asyncio conflict")
             
-            logger.info(f"Executing automation plan: {task_description}")
-            logger.info(f"Target website: {target_website}")
-            logger.info(f"Micro-steps count: {len(micro_steps)}")
-            logger.info(f"Execution strategy: {execution_strategy}")
-            
-            # Use the correct browser_session context manager pattern
-            from bedrock_agentcore.tools.browser_client import browser_session
-            
-            results = []
-            success_count = 0
-            failed_count = 0
-            
-            try:
-                # Use browser_session context manager (correct pattern)
-                with browser_session(self.aws_region) as client:
-                    ws_url, headers = client.generate_ws_headers()
-                    
-                    # Initialize Nova Act with the browser session
-                    with NovaAct(
-                        cdp_endpoint_url=ws_url,
-                        cdp_headers=headers,
-                        nova_act_api_key=self.nova_act_api_key,
-                        starting_page=target_website,
-                    ) as nova_act:
-                        
-                        # Execute micro-steps
-                        for step in micro_steps:
-                            try:
-                                instruction = step.get('instruction', '')
-                                timeout_seconds = step.get('timeout_seconds', 60)
-                                nova_act_type = step.get('nova_act_type', 'general')
-                                
-                                logger.info(f"Executing step {step.get('step_number', 0)}: {nova_act_type} - {instruction[:50]}...")
-                                
-                                # Execute the step using Nova Act
-                                result = nova_act.act(instruction)
-                                
-                                # Parse result
-                                result_text = ""
-                                if hasattr(result, 'response') and result.response:
-                                    result_text = str(result.response)
-                                elif hasattr(result, 'parsed_response') and result.parsed_response:
-                                    result_text = str(result.parsed_response)
-                                else:
-                                    result_text = str(result)
-                                
-                                # Create execution result
-                                execution_result = NovaActExecutionResult(
-                                    instruction=instruction,
-                                    status="success",
-                                    result_text=result_text,
-                                    error_message=None,
-                                    execution_time=0.0,  # Would need to measure actual time
-                                    retry_count=0,
-                                    browser_state={}
-                                )
-                                
-                                results.append(execution_result)
-                                success_count += 1
-                                
-                                logger.info(f"Step {step.get('step_number', 0)} completed successfully")
-                                
-                                # Small delay between steps
-                                await asyncio.sleep(1)
-                                
-                            except Exception as e:
-                                logger.error(f"Error executing step {step.get('step_number', 0)}: {str(e)}")
-                                
-                                execution_result = NovaActExecutionResult(
-                                    instruction=step.get('instruction', ''),
-                                    status="failed",
-                                    result_text="",
-                                    error_message=str(e),
-                                    execution_time=0.0,
-                                    retry_count=0,
-                                    browser_state={}
-                                )
-                                
-                                results.append(execution_result)
-                                failed_count += 1
-                                
-                                # Check for blackhole detection
-                                blackhole_detection = step.get('blackhole_detection', {})
-                                if self._detect_blackhole_from_step(step, execution_result, blackhole_detection):
-                                    logger.warning("Blackhole detected, stopping execution")
-                                    break
-                        
-            except Exception as e:
-                logger.error(f"Browser session error: {str(e)}")
-                return {
-                    "status": "error",
-                    "message": f"Browser session failed: {str(e)}",
-                    "requires_human": True
-                }
-            
-            return {
-                "status": "success" if failed_count == 0 else "partial" if success_count > 0 else "failed",
-                "message": f"Executed {len(micro_steps)} micro-steps: {success_count} successful, {failed_count} failed",
-                "session_id": session_id,
-                "results": [r.__dict__ for r in results],
-                "success_count": success_count,
-                "failed_count": failed_count,
-                "requires_human": failed_count > 0
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to execute execution plan: {str(e)}")
-            return {
-                "status": "error",
-                "message": f"Execution plan failed: {str(e)}",
-                "requires_human": True
-            }
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._execute_nova_act_sync, execution_plan)
+                try:
+                    result = future.result(timeout=300)  # 5 minute timeout
+                    logger.info("✅ Nova Act execution completed successfully in thread")
+                    return result
+                except concurrent.futures.TimeoutError:
+                    logger.error("❌ Nova Act execution timed out")
+                    return {
+                        'status': 'error',
+                        'message': 'Execution timed out after 5 minutes',
+                        'session_id': execution_plan.get('session_id', 'unknown'),
+                        'completed_steps': [],
+                        'failed_step': None,
+                        'error_detection': None,
+                        'success_count': 0,
+                        'failed_count': 1,
+                        'requires_human': True,
+                        'suggestions': ['Task took too long, try with simpler steps']
+                    }
+                except Exception as e:
+                    logger.error(f"❌ Nova Act execution failed in thread: {str(e)}")
+                    return {
+                        'status': 'error',
+                        'message': f'Thread execution failed: {str(e)}',
+                        'session_id': execution_plan.get('session_id', 'unknown'),
+                        'completed_steps': [],
+                        'failed_step': None,
+                        'error_detection': None,
+                        'success_count': 0,
+                        'failed_count': 1,
+                        'requires_human': True,
+                        'suggestions': ['Check browser connection and try again']
+                    }
+        else:
+            # Run directly in sync context (like test script)
+            logger.info("✅ Running Nova Act directly in sync context")
+            return self._execute_nova_act_sync(execution_plan)
     
-    async def _execute_sequential(self, micro_steps: List[Dict[str, Any]], session_id: str) -> List[NovaActExecutionResult]:
-        """Execute micro-steps sequentially."""
-        results = []
+    def _execute_steps_with_error_detection(
+        self, 
+        nova_act: NovaAct, 
+        micro_steps: List[Dict[str, Any]], 
+        session_id: str,
+        credentials: Dict[str, Any] = None
+    ) -> NovaActExecutionSummary:
+        """Execute micro-steps with intelligent error detection using BOOL_SCHEMA."""
+        
+        completed_steps = []
+        success_count = 0
+        failed_count = 0
+        failed_step = None
         
         for step in micro_steps:
             try:
-                # Extract step details
                 instruction = step.get('instruction', '')
-                timeout_seconds = step.get('timeout_seconds', 60)
+                step_number = step.get('step_number', 0)
                 nova_act_type = step.get('nova_act_type', 'general')
+                timeout_seconds = step.get('timeout_seconds', 30)
+                retry_count = step.get('retry_count', 3)
                 
-                logger.info(f"Executing step {step.get('step_number', 0)}: {nova_act_type} - {instruction[:50]}...")
+                logger.info(f"Executing step {step_number}: {nova_act_type} - {instruction[:50]}...")
                 
-                # Execute the step
-                result = await self.execute_instruction(session_id, instruction, timeout_seconds)
-                results.append(result)
+                # Execute the step with retry logic and credentials
+                execution_result = self._execute_step_with_retry(
+                    nova_act, instruction, step_number, nova_act_type, timeout_seconds, retry_count, credentials
+                )
                 
-                # Check for blackhole detection
-                if result.status == "failed":
-                    blackhole_detection = step.get('blackhole_detection', {})
-                    if self._detect_blackhole_from_step(step, result, blackhole_detection):
-                        logger.warning("Blackhole detected, pausing execution")
-                        break
+                completed_steps.append(execution_result)
+                
+                if execution_result.status == "success":
+                    success_count += 1
+                    logger.info(f"Step {step_number} completed successfully")
+                else:
+                    failed_count += 1
+                    failed_step = execution_result
+                    logger.warning(f"Step {step_number} failed: {execution_result.error_message}")
+                    
+                    # If step failed, try error detection to understand why
+                    try:
+                        error_detection = self._detect_errors_with_bool_schema(nova_act)
+                        if error_detection.has_difficulties or error_detection.is_stuck_in_loop:
+                            logger.warning(f"Error detected after step {step_number}: {error_detection.error_type}")
+                            
+                            # Return with error detection results
+                            return NovaActExecutionSummary(
+                                status="failed",
+                                message=f"Execution stopped due to error detection at step {step_number}",
+                                session_id=session_id,
+                                completed_steps=completed_steps,
+                                failed_step=failed_step,
+                                error_detection=error_detection,
+                                success_count=success_count,
+                                failed_count=failed_count,
+                                requires_human=True,
+                                suggestions=error_detection.suggestions
+                            )
+                    except Exception as e:
+                        logger.warning(f"Error detection failed after step {step_number}: {str(e)}")
                 
                 # Small delay between steps
-                await asyncio.sleep(1)
+                time.sleep(1)
                 
             except Exception as e:
-                logger.error(f"Error executing step: {str(e)}")
-                results.append(NovaActExecutionResult(
-                    instruction=step.get('instruction', ''),
+                logger.error(f"Error executing step {step_number}: {str(e)}")
+                
+                execution_result = NovaActExecutionResult(
+                    instruction=instruction,
                     status="failed",
                     result_text="",
                     error_message=str(e),
                     execution_time=0.0,
                     retry_count=0,
                     browser_state={}
-                ))
-        
-        return results
-    
-    async def _execute_parallel(self, micro_steps: List[Dict[str, Any]], session_id: str) -> List[NovaActExecutionResult]:
-        """Execute micro-steps in parallel (where possible)."""
-        # For now, fallback to sequential execution
-        # Parallel execution would require more complex dependency management
-        return await self._execute_sequential(micro_steps, session_id)
-    
-    def _detect_blackhole_from_step(self, step: Dict[str, Any], result: NovaActExecutionResult, blackhole_config: Dict[str, Any]) -> bool:
-        """Detect blackhole based on step configuration."""
-        try:
-            max_failures = blackhole_config.get('max_consecutive_failures', 3)
-            max_errors = blackhole_config.get('max_similar_errors', 5)
-            
-            # Simple blackhole detection based on step configuration
-            if result.status == "failed":
-                # This would need to track consecutive failures per step
-                # For now, return False as a placeholder
-                return False
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error in blackhole detection: {str(e)}")
-            return False
-    
-    async def pause_session(self, session_id: str) -> bool:
-        """Pause a Nova Act session."""
-        try:
-            if session_id not in self.active_sessions:
-                return False
-            
-            session = self.active_sessions[session_id]
-            session.status = "paused"
-            logger.info(f"Paused Nova Act session {session_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to pause session {session_id}: {str(e)}")
-            return False
-    
-    async def resume_session(self, session_id: str) -> bool:
-        """Resume a paused Nova Act session."""
-        try:
-            if session_id not in self.active_sessions:
-                return False
-            
-            session = self.active_sessions[session_id]
-            if session.status == "paused":
-                session.status = "active"
-                logger.info(f"Resumed Nova Act session {session_id}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to resume session {session_id}: {str(e)}")
-            return False
-    
-    async def close_session(self, session_id: str) -> bool:
-        """Close a Nova Act session and cleanup resources."""
-        try:
-            if session_id not in self.active_sessions:
-                return False
-            
-            session = self.active_sessions[session_id]
-            
-            # Cleanup Nova Act
-            if session.nova_act:
-                await self._cleanup_nova_act(session.nova_act)
-            
-            # Cleanup browser client
-            if session.browser_client:
-                await self._cleanup_browser_client(session.browser_client)
-            
-            # Remove from active sessions
-            del self.active_sessions[session_id]
-            
-            logger.info(f"Closed Nova Act session {session_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to close session {session_id}: {str(e)}")
-            return False
-    
-    def get_session_status(self, session_id: str) -> Dict[str, Any]:
-        """Get status of a Nova Act session."""
-        if session_id not in self.active_sessions:
-            return {"status": "not_found"}
-        
-        session = self.active_sessions[session_id]
-        return {
-            "session_id": session_id,
-            "status": session.status,
-            "start_time": session.start_time.isoformat(),
-            "current_instruction": session.current_instruction,
-            "execution_count": len(session.execution_history),
-            "consecutive_failures": session.consecutive_failures,
-            "blackhole_detection_count": session.blackhole_detection_count,
-            "browser_state": self._get_browser_state(session)
-        }
-    
-    async def _initialize_browser_client(self) -> Optional[BrowserClient]:
-        """Initialize AWS Bedrock Agent Core Browser client using browser_session context manager."""
-        try:
-            logger.info("Initializing browser client for Nova Act agent...")
-            
-            # Use the correct browser_session context manager approach
-            from bedrock_agentcore.tools.browser_client import browser_session
-            
-            # Create browser session using the context manager
-            # This is the correct way according to the documentation
-            browser_client = browser_session(self.aws_region)
-            browser_client.__enter__()  # Start the session
-            
-            logger.info("Browser client initialized successfully for Nova Act agent")
-            return browser_client
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize browser client: {str(e)}")
-            return None
-    
-    async def _initialize_nova_act(self, browser_client: BrowserClient, starting_page: str) -> Optional[NovaAct]:
-        """Initialize Nova Act with browser client using the correct pattern."""
-        try:
-            logger.info(f"Initializing Nova Act with starting page: {starting_page}")
-            
-            # Generate WebSocket URL and headers from browser client
-            ws_url, headers = browser_client.generate_ws_headers()
-            
-            # Initialize Nova Act with the correct parameters
-            nova_act = NovaAct(
-                cdp_endpoint_url=ws_url,
-                cdp_headers=headers,
-                preview={"playwright_actuation": True},
-                nova_act_api_key=self.nova_act_api_key,
-                starting_page=starting_page
-            )
-            
-            # Start Nova Act (following the documentation pattern)
-            nova_act.start()
-            
-            logger.info("Nova Act initialized and started successfully")
-            return nova_act
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Nova Act: {str(e)}")
-            return None
-    
-    async def _execute_with_timeout(self, session: NovaActSession, instruction: str, timeout_seconds: int) -> Any:
-        """Execute Nova Act instruction with timeout."""
-        try:
-            # Run Nova Act in a thread pool to avoid asyncio conflicts
-            loop = asyncio.get_event_loop()
-            
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Submit the Nova Act execution to the thread pool
-                future = executor.submit(self._run_nova_act_sync, session.nova_act, instruction)
-                
-                # Wait for the result with timeout
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: future.result()),
-                    timeout=timeout_seconds
                 )
                 
-                return result
+                completed_steps.append(execution_result)
+                failed_count += 1
+                failed_step = execution_result
                 
-        except asyncio.TimeoutError:
-            logger.error(f"Nova Act instruction timed out after {timeout_seconds} seconds")
-            raise Exception(f"Instruction timed out after {timeout_seconds} seconds")
-        except Exception as e:
-            logger.error(f"Failed to execute Nova Act instruction: {str(e)}")
-            raise e
-    
-    def _run_nova_act_sync(self, nova_act: NovaAct, instruction: str) -> Any:
-        """Run Nova Act synchronously in a separate thread."""
-        try:
-            # Execute the instruction using the correct Nova Act pattern
-            result = nova_act.act(instruction)
-            logger.info(f"Nova Act executed instruction: {instruction[:50]}...")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Nova Act execution failed in thread: {str(e)}")
-            raise e
-    
-    def _detect_blackhole_from_step(self, step: Dict[str, Any], execution_result: NovaActExecutionResult, blackhole_detection: Dict[str, Any]) -> bool:
-        """Detect blackhole from step execution result."""
-        try:
-            # Check for consecutive failures
-            max_consecutive_failures = blackhole_detection.get('max_consecutive_failures', 3)
-            max_similar_errors = blackhole_detection.get('max_similar_errors', 2)
-            monitoring_keywords = blackhole_detection.get('monitoring_keywords', [])
-            
-            # Simple blackhole detection based on error patterns
-            if execution_result.status == "failed" and execution_result.error_message:
-                error_lower = execution_result.error_message.lower()
+                # Check for blackhole detection
+                error_detection = self._detect_errors_with_bool_schema(nova_act)
                 
-                # Check for monitoring keywords
-                for keyword in monitoring_keywords:
-                    if keyword.lower() in error_lower:
-                        logger.warning(f"Blackhole keyword detected: {keyword}")
-                        return True
-                
-                # Check for repetitive error patterns
-                if "timeout" in error_lower or "not found" in error_lower:
-                    logger.warning("Potential blackhole detected: repetitive error pattern")
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error in blackhole detection: {str(e)}")
-            return False
-    
-    def _detect_blackhole(self, session: NovaActSession, instruction: str, result_text: str, error_message: Optional[str]) -> bool:
-        """Detect if the session is stuck in a blackhole."""
-        try:
-            # Check for consecutive failures
-            if session.consecutive_failures >= self.max_consecutive_failures:
-                logger.warning(f"Blackhole detected: {session.consecutive_failures} consecutive failures")
-                return True
-            
-            # Check for similar errors repeating
-            recent_results = session.execution_history[-self.max_similar_errors:]
-            similar_errors = [r for r in recent_results if r.status == "failed" and r.error_message]
-            
-            if len(similar_errors) >= self.max_similar_errors:
-                logger.warning(f"Blackhole detected: {len(similar_errors)} similar errors")
-                return True
-            
-            # Check for timeout scenarios
-            if error_message and "timeout" in error_message.lower():
-                if len([r for r in recent_results if "timeout" in (r.error_message or "").lower()]) >= 3:
-                    logger.warning("Blackhole detected: Multiple timeout errors")
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error in blackhole detection: {str(e)}")
-            return False
-    
-    def _get_browser_state(self, session: NovaActSession) -> Dict[str, Any]:
-        """Get current browser state."""
-        try:
-            return {
-                "session_active": session.status == "active",
-                "current_url": "unknown",  # Would need to get from browser
-                "execution_count": len(session.execution_history),
-                "last_instruction": session.current_instruction,
-                "consecutive_failures": session.consecutive_failures
-            }
-        except Exception as e:
-            logger.error(f"Error getting browser state: {str(e)}")
-            return {}
-    
-    async def _check_step_conditions(self, session_id: str, enhanced_step: Any) -> bool:
-        """Check if step conditions are met before execution."""
-        try:
-            # This would implement condition checking logic
-            # For now, return True as a placeholder
-            return True
-        except Exception as e:
-            logger.error(f"Error checking step conditions: {str(e)}")
-            return False
-    
-    async def _apply_edge_case_recovery(self, session_id: str, enhanced_step: Any, failed_result: NovaActExecutionResult) -> NovaActExecutionResult:
-        """Apply edge case recovery to a failed execution."""
-        try:
-            # Find applicable edge case
-            applicable_edge_case = None
-            for edge_case in enhanced_step.edge_cases:
-                condition = edge_case.get('condition', '')
-                if condition in (failed_result.error_message or "").lower():
-                    applicable_edge_case = edge_case
+                if error_detection.is_stuck_in_loop:
+                    logger.warning(f"Blackhole detected at step {step_number}")
                     break
-            
-            if applicable_edge_case:
-                # Apply the edge case recovery action
-                recovery_instruction = applicable_edge_case.get('nova_instruction', '')
-                if recovery_instruction:
-                    logger.info(f"Applying edge case recovery: {recovery_instruction}")
-                    return await self.execute_instruction(session_id, recovery_instruction)
-            
-            return failed_result
-            
-        except Exception as e:
-            logger.error(f"Error applying edge case recovery: {str(e)}")
-            return failed_result
+        
+        # Determine final status
+        if failed_count == 0:
+            status = "success"
+            message = f"Successfully executed all {len(micro_steps)} micro-steps"
+            requires_human = False
+        elif success_count > 0:
+            status = "partial"
+            message = f"Executed {len(micro_steps)} micro-steps: {success_count} successful, {failed_count} failed"
+            requires_human = True
+        else:
+            status = "failed"
+            message = f"Failed to execute any of the {len(micro_steps)} micro-steps"
+            requires_human = True
+        
+        return NovaActExecutionSummary(
+            status=status,
+            message=message,
+            session_id=session_id,
+            completed_steps=completed_steps,
+            failed_step=failed_step,
+            success_count=success_count,
+            failed_count=failed_count,
+            requires_human=requires_human,
+            suggestions=[]
+        )
     
-    async def _cleanup_nova_act(self, nova_act: NovaAct):
-        """Cleanup Nova Act resources."""
+    def _detect_errors_with_bool_schema(self, nova_act: NovaAct) -> NovaActErrorDetection:
+        """Detect errors using multiple BOOL_SCHEMA questions with improved prompts."""
+        
         try:
-            if nova_act:
-                # Stop Nova Act
-                nova_act.stop()
-                logger.info("Nova Act cleaned up successfully")
+            # Question 1: Check for general difficulties with more specific prompt
+            difficulties_result = self._safe_act_with_bool_schema(
+                nova_act,
+                "Look at the current page. Are there any error messages, broken elements, or issues that would prevent me from continuing? If the page looks normal and functional, return false. If you see any errors, problems, or broken elements, return true."
+            )
+            has_difficulties = difficulties_result
+            
+            # Question 2: Check if stuck in a loop with more specific prompt
+            loop_result = self._safe_act_with_bool_schema(
+                nova_act,
+                "Am I repeating the same action or seeing the same error multiple times? If I'm making progress or this is the first time seeing this, return false. If I'm stuck repeating the same thing, return true."
+            )
+            is_stuck_in_loop = loop_result
+            
+            # Question 3: Check if can proceed with more specific prompt
+            proceed_result = self._safe_act_with_bool_schema(
+                nova_act,
+                "Can I see the next element I need to interact with or the next step I need to take? If yes, return true. If the page is blank, broken, or I can't see what to do next, return false."
+            )
+            can_proceed = proceed_result
+            
+            # Determine error type and suggestions
+            error_type = None
+            suggestions = []
+            
+            if has_difficulties:
+                error_type = "general_difficulties"
+                suggestions.append("Check for page errors or unexpected elements")
+                suggestions.append("Try refreshing the page or waiting for it to load completely")
+            
+            if is_stuck_in_loop:
+                error_type = "infinite_loop"
+                suggestions.append("Stop execution to prevent infinite loops")
+                suggestions.append("Review the current step and try a different approach")
+                suggestions.append("Check if the page requires different interaction")
+            
+            if not can_proceed:
+                error_type = "cannot_proceed"
+                suggestions.append("Current state prevents proceeding to next step")
+                suggestions.append("Check for missing elements or blocked actions")
+                suggestions.append("Wait for page to load completely before proceeding")
+            
+            return NovaActErrorDetection(
+                has_difficulties=has_difficulties,
+                is_stuck_in_loop=is_stuck_in_loop,
+                can_proceed=can_proceed,
+                error_type=error_type,
+                suggestions=suggestions
+            )
+            
         except Exception as e:
-            logger.warning(f"Error cleaning up Nova Act: {str(e)}")
+            logger.error(f"Error in error detection: {str(e)}")
+            return NovaActErrorDetection(
+                has_difficulties=True,
+                is_stuck_in_loop=False,
+                can_proceed=False,
+                error_type="detection_error",
+                suggestions=[f"Error detection failed: {str(e)}"]
+            )
     
-    async def _cleanup_browser_client(self, browser_client: BrowserClient):
-        """Cleanup browser client resources."""
+    def _execute_step_with_retry(self, nova_act: NovaAct, instruction: str, step_number: int, 
+                                nova_act_type: str, timeout_seconds: int, retry_count: int, 
+                                credentials: Dict[str, Any] = None) -> NovaActExecutionResult:
+        """Execute a single step with retry logic and proper error handling."""
+        
+        for attempt in range(retry_count + 1):
+            try:
+                logger.info(f"Step {step_number} attempt {attempt + 1}/{retry_count + 1}")
+                
+                # Execute the step with secure credential handling
+                start_time = time.time()
+                
+                # Check if this is an input step that needs credentials
+                if nova_act_type == "input" and credentials:
+                    result = self._execute_input_step_with_credentials(nova_act, instruction, credentials)
+                else:
+                    result = nova_act.act(instruction)
+                
+                execution_time = time.time() - start_time
+                
+                # Parse result
+                result_text = ""
+                if hasattr(result, 'response') and result.response:
+                    result_text = str(result.response)
+                elif hasattr(result, 'parsed_response') and result.parsed_response:
+                    result_text = str(result.parsed_response)
+                else:
+                    result_text = str(result)
+                
+                # Check if the result indicates success
+                if self._is_step_successful(result, result_text, nova_act_type):
+                    return NovaActExecutionResult(
+                        instruction=instruction,
+                        status="success",
+                        result_text=result_text,
+                        error_message=None,
+                        execution_time=execution_time,
+                        retry_count=attempt,
+                        browser_state={}
+                    )
+                else:
+                    # Step didn't succeed, try again if we have retries left
+                    if attempt < retry_count:
+                        logger.warning(f"Step {step_number} attempt {attempt + 1} didn't succeed, retrying...")
+                        time.sleep(2)  # Wait before retry
+                        continue
+                    else:
+                        # Final attempt failed
+                        return NovaActExecutionResult(
+                            instruction=instruction,
+                            status="failed",
+                            result_text=result_text,
+                            error_message=f"Step failed after {retry_count + 1} attempts",
+                            execution_time=execution_time,
+                            retry_count=attempt,
+                            browser_state={}
+                        )
+                        
+            except Exception as e:
+                logger.warning(f"Step {step_number} attempt {attempt + 1} failed with exception: {str(e)}")
+                
+                if attempt < retry_count:
+                    time.sleep(2)  # Wait before retry
+                    continue
+                else:
+                    # Final attempt failed with exception
+                    return NovaActExecutionResult(
+                        instruction=instruction,
+                        status="failed",
+                        result_text="",
+                        error_message=f"Step failed with exception after {retry_count + 1} attempts: {str(e)}",
+                        execution_time=0.0,
+                        retry_count=attempt,
+                        browser_state={}
+                    )
+        
+        # This should never be reached, but just in case
+        return NovaActExecutionResult(
+            instruction=instruction,
+            status="failed",
+            result_text="",
+            error_message="Step failed after all retry attempts",
+            execution_time=0.0,
+            retry_count=retry_count,
+            browser_state={}
+        )
+    
+    def _is_step_successful(self, result, result_text: str, nova_act_type: str) -> bool:
+        """Determine if a step was successful based on the result and type."""
         try:
-            if browser_client:
-                # Use the context manager exit method
-                browser_client.__exit__(None, None, None)
-                logger.info("Browser client cleaned up successfully")
+            # Check for explicit success indicators in the result
+            if hasattr(result, 'response') and result.response:
+                response_lower = str(result.response).lower()
+                if any(success_word in response_lower for success_word in ['success', 'completed', 'done', 'finished']):
+                    return True
+                if any(error_word in response_lower for error_word in ['error', 'failed', 'cannot', 'unable']):
+                    return False
+            
+            # For navigation steps, success is usually just reaching the page
+            if nova_act_type == "navigate":
+                return True
+            
+            # For click steps, success is usually if no error occurred
+            if nova_act_type == "click":
+                return "error" not in result_text.lower()
+            
+            # For input steps, success is usually if text was entered
+            if nova_act_type == "input":
+                return "entered" in result_text.lower() or "filled" in result_text.lower()
+            
+            # For other steps, assume success if no explicit error
+            return "error" not in result_text.lower() and "failed" not in result_text.lower()
+            
         except Exception as e:
-            logger.warning(f"Error cleaning up browser client: {str(e)}")
+            logger.warning(f"Error checking step success: {str(e)}")
+            return True  # Default to success if we can't determine
+    
+    def _safe_act_with_bool_schema(self, nova_act: NovaAct, prompt: str) -> bool:
+        """Safely execute a BOOL_SCHEMA act with fallback handling."""
+        try:
+            result = nova_act.act(prompt, schema=BOOL_SCHEMA)
+            
+            # Check if the result is valid
+            if hasattr(result, 'matches_schema') and result.matches_schema:
+                if hasattr(result, 'parsed_response'):
+                    return bool(result.parsed_response)
+                elif hasattr(result, 'response'):
+                    # Try to parse the response as boolean
+                    response_str = str(result.response).lower().strip()
+                    if response_str in ['true', 'yes', '1', 'on']:
+                        return True
+                    elif response_str in ['false', 'no', '0', 'off']:
+                        return False
+            
+            # If schema doesn't match or no parsed response, default to False (no error)
+            logger.warning(f"BOOL_SCHEMA result not valid, defaulting to False: {result}")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error in safe_act_with_bool_schema: {str(e)}, defaulting to False")
+            return False
+    
+    def _execute_input_step_with_credentials(self, nova_act: NovaAct, instruction: str, credentials: Dict[str, Any]) -> Any:
+        """
+        Execute input step with secure credential handling using Playwright's API.
+        
+        Args:
+            nova_act: Nova Act instance
+            instruction: The instruction for the input step
+            credentials: User credentials dictionary
+            
+        Returns:
+            Result from Nova Act execution
+        """
+        try:
+            # First, let Nova Act identify the input field
+            field_identification_result = nova_act.act(instruction)
+            
+            # Determine which credential to use based on the instruction
+            credential_value = None
+            if "username" in instruction.lower() or "email" in instruction.lower():
+                credential_value = credentials.get('email', '')
+            elif "password" in instruction.lower():
+                credential_value = credentials.get('password', '')
+            elif "ic" in instruction.lower() or "identity" in instruction.lower():
+                credential_value = credentials.get('ic_number', '')
+            elif "phone" in instruction.lower():
+                credential_value = credentials.get('phone', '')
+            
+            if credential_value:
+                # Use Playwright's API to securely type the credential
+                logger.info(f"Securely entering credential for: {instruction[:50]}...")
+                nova_act.page.keyboard.type(credential_value)
+                
+                # Return success result
+                return type('Result', (), {
+                    'response': f"Successfully entered {len(credential_value)} characters securely",
+                    'parsed_response': f"Successfully entered {len(credential_value)} characters securely",
+                    'valid_json': True,
+                    'matches_schema': True
+                })()
+            else:
+                # No matching credential found, use regular Nova Act
+                logger.warning(f"No matching credential found for instruction: {instruction}")
+                return field_identification_result
+                
+        except Exception as e:
+            logger.error(f"Error in secure credential input: {str(e)}")
+            # Fallback to regular Nova Act execution
+            return nova_act.act(instruction)
 
 
 # Global Nova Act agent instance

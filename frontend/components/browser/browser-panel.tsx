@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { DCVViewer } from './dcv-viewer';
 import { 
   Monitor, 
   Play, 
@@ -16,7 +17,8 @@ import {
   MousePointer,
   Bot,
   Eye,
-  EyeOff
+  EyeOff,
+  Video
 } from 'lucide-react';
 
 interface BrowserPanelProps {
@@ -33,6 +35,9 @@ interface BrowserStatus {
   browser_connected: boolean;
   hyperbrowser_session_active: boolean;
   hyperbrowser_live_url?: string;
+  live_view_url?: string;
+  presigned_url?: string;
+  streaming_enabled?: boolean;
 }
 
 export function BrowserPanel({ 
@@ -50,6 +55,8 @@ export function BrowserPanel({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [connectionAttempts, setConnectionAttempts] = useState(0);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingUrl, setStreamingUrl] = useState<string | null>(null);
   
   const wsRef = useRef<WebSocket | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -212,6 +219,20 @@ export function BrowserPanel({
         }
         break;
         
+      case 'live_view_available':
+        // Handle live view streaming availability
+        const { live_view_url, presigned_url, streaming_enabled } = message;
+        if (live_view_url && streaming_enabled) {
+          setStreamingUrl(live_view_url);
+          setIsStreaming(true);
+        }
+        break;
+        
+      case 'browser_session_created':
+        // Handle browser session creation
+        console.log('Browser session created:', message.session_id);
+        break;
+        
       case 'control_taken':
         setUserHasControl(true);
         break;
@@ -271,6 +292,20 @@ export function BrowserPanel({
     }
   };
 
+  const handleDCVConnect = () => {
+    console.log('DCV viewer connected successfully');
+  };
+
+  const handleDCVDisconnect = () => {
+    console.log('DCV viewer disconnected');
+    setIsStreaming(false);
+  };
+
+  const handleDCVError = (error: string) => {
+    console.error('DCV viewer error:', error);
+    setError(error);
+  };
+
   if (!isVisible) return null;
 
   const currentLiveUrl = liveUrl || browserStatus?.hyperbrowser_live_url;
@@ -290,6 +325,12 @@ export function BrowserPanel({
               <Badge variant="default" className="flex items-center gap-1">
                 <Bot className="h-3 w-3" />
                 Browser Active
+              </Badge>
+            )}
+            {isStreaming && (
+              <Badge variant="default" className="flex items-center gap-1">
+                <Video className="h-3 w-3" />
+                Live Streaming
               </Badge>
             )}
             {userHasControl && (
@@ -445,18 +486,31 @@ export function BrowserPanel({
                 </div>
               </div>
               
-              {/* Browser iframe */}
+              {/* Browser Display - DCV or iframe fallback */}
               <div className="flex-1 relative">
-                <iframe
-                  ref={iframeRef}
-                  src={currentLiveUrl}
-                  className="w-full h-full border-0"
-                  allow="camera; microphone; clipboard-read; clipboard-write"
-                  sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
-                />
+                {isStreaming && streamingUrl ? (
+                  /* DCV Live Streaming Display */
+                  <DCVViewer
+                    liveViewUrl={streamingUrl}
+                    sessionId={sessionId}
+                    onConnect={handleDCVConnect}
+                    onDisconnect={handleDCVDisconnect}
+                    onError={handleDCVError}
+                    className="w-full h-full"
+                  />
+                ) : (
+                  /* Fallback iframe for non-streaming mode */
+                  <iframe
+                    ref={iframeRef}
+                    src={currentLiveUrl}
+                    className="w-full h-full border-0"
+                    allow="camera; microphone; clipboard-read; clipboard-write"
+                    sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+                  />
+                )}
                 
                 {userHasControl && (
-                  <div className="absolute top-2 left-2 bg-red-600 text-white px-2 py-1 rounded text-xs font-medium">
+                  <div className="absolute top-2 left-2 bg-red-600 text-white px-2 py-1 rounded text-xs font-medium z-20">
                     You have control
                   </div>
                 )}
